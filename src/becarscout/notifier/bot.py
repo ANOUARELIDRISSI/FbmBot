@@ -11,14 +11,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
 from becarscout.db import get_session
 from becarscout.db import repository as repo
+from becarscout.db.models import ListingRow
 from becarscout.feedback_agent import apply_latest_suggestions, run_feedback_review
 from becarscout.feedback_agent.memory import find_similar_feedback, store_feedback_memory
 from becarscout.scoring.models import ScoredListing
@@ -31,6 +40,22 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 CALLBACK_PREFIX = "fb"
+SETTINGS_CALLBACK_PREFIX = "set"
+
+# Chat id -> which command is waiting for its value on the *next* plain
+# message from that chat. Lets /budget, /minyear, /threshold, /radius (and
+# the /settings buttons) work as a two-step prompt ("send me the value")
+# instead of requiring the full command-with-args up front. In-memory and
+# per-process only — acceptable here since a listener restart losing a
+# half-finished prompt just means re-tapping the button, no data at risk.
+_pending_prompts: dict[int, str] = {}
+
+_SETTINGS_PROMPTS: dict[str, str] = {
+    "budget": "Send me your budget: a max (`15000`), a range (`3000 15000`), or `off` to clear it.",
+    "minyear": "Send me the minimum year (e.g. `2015`), or `off` to disable the cutoff.",
+    "threshold": "Send me the minimum score a listing needs to reach Telegram (e.g. `25`).",
+    "radius": "Send me the search radius in km (e.g. `150`).",
+}
 
 # python-telegram-bot's defaults (5s connect/read, 1s pool timeout) are too
 # tight for a container's network path — a single slow DNS lookup or a
@@ -186,14 +211,31 @@ def _budget_text(settings) -> str:
     return f"{lo} - {hi}"
 
 
-async def _reply(update: Update, text: str) -> None:
+async def _reply(update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     if update.effective_chat:
-        await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text)
+        await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("💰 Budget", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:budget"),
+                InlineKeyboardButton("📅 Min year", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:minyear"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Threshold", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:threshold"),
+                InlineKeyboardButton("📍 Radius", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:radius"),
+            ],
+        ]
+    )
 
 
 async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/settings` — shows every parameter the other commands below can
-    change, in one place, since each of them only shows/changes its own."""
+    change, in one place, since each of them only shows/changes its own.
+    Tapping a button below prompts for the new value, same as sending the
+    matching command with no arguments."""
     session = get_session()
     try:
         settings = repo.get_pipeline_settings(session)
@@ -207,9 +249,45 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
         f"Budget: {_budget_text(settings)}\n"
         f"Min year: {min_year_text}\n"
         f"Score threshold: {settings.threshold}\n\n"
-        "Change with /budget, /minyear, /threshold, /radius. "
+        "Tap a button to change one, or use /budget, /minyear, /threshold, /radius directly. "
         "Takes effect from the next scrape/score onward.",
+        reply_markup=_settings_keyboard(),
     )
+
+
+async def _handle_settings_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles taps on the `/settings` buttons — prompts for the new value
+    exactly like sending e.g. `/budget` with no arguments would."""
+    query = update.callback_query
+    if not query or not query.data or not update.effective_chat:
+        return
+    await query.answer()
+    try:
+        _, setting = query.data.split(":", 1)
+    except ValueError:
+        return
+    prompt = _SETTINGS_PROMPTS.get(setting)
+    if prompt is None:
+        return
+    _pending_prompts[update.effective_chat.id] = setting
+    if query.message:
+        await query.message.reply_text(prompt)
+
+
+async def _handle_plain_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Completes a pending `/budget`/`/minyear`/`/threshold`/`/radius`
+    prompt — whatever plain text the user sends next is treated as the
+    arguments that command would have taken directly (`/budget 15000` and
+    replying `15000` to the prompt do the same thing)."""
+    chat = update.effective_chat
+    if not chat or chat.id not in _pending_prompts or not update.message or not update.message.text:
+        return
+    command = _pending_prompts.pop(chat.id)
+    handler = _PROMPTABLE_COMMANDS.get(command)
+    if handler is None:
+        return
+    context.args = update.message.text.split()
+    await handler(update, context)
 
 
 async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -221,7 +299,9 @@ async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         if not args:
             settings = repo.get_pipeline_settings(session)
-            await _reply(update, f"Current budget: {_budget_text(settings)}\nUsage: /budget <max>, /budget <min> <max>, or /budget off")
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "budget"
+            await _reply(update, f"Current budget: {_budget_text(settings)}\n{_SETTINGS_PROMPTS['budget']}")
             return
 
         if args[0].lower() == "off":
@@ -252,7 +332,9 @@ async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not args:
             settings = repo.get_pipeline_settings(session)
             current = str(settings.min_year) if settings.min_year is not None else "off"
-            await _reply(update, f"Current min year: {current}\nUsage: /minyear <year> or /minyear off")
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "minyear"
+            await _reply(update, f"Current min year: {current}\n{_SETTINGS_PROMPTS['minyear']}")
             return
 
         if args[0].lower() == "off":
@@ -277,7 +359,9 @@ async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         if not args:
             settings = repo.get_pipeline_settings(session)
-            await _reply(update, f"Current score threshold: {settings.threshold}\nUsage: /threshold <n>")
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "threshold"
+            await _reply(update, f"Current score threshold: {settings.threshold}\n{_SETTINGS_PROMPTS['threshold']}")
             return
         value = _parse_int_arg(args[0])
         if value is None:
@@ -296,7 +380,9 @@ async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         if not args:
             settings = repo.get_pipeline_settings(session)
-            await _reply(update, f"Current search radius: {settings.radius_km} km\nUsage: /radius <km>")
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "radius"
+            await _reply(update, f"Current search radius: {settings.radius_km} km\n{_SETTINGS_PROMPTS['radius']}")
             return
         km = _parse_int_arg(args[0])
         if km is None or km <= 0:
@@ -306,6 +392,103 @@ async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     finally:
         session.close()
     await _reply(update, f"Search radius set: {settings.radius_km} km (applies from the next scrape onward)")
+
+
+# Maps a pending-prompt key (see _SETTINGS_PROMPTS) to the same handler its
+# matching /command uses — defined after all four exist so _handle_plain_reply
+# and the /settings buttons can dispatch to them without duplicating logic.
+_PROMPTABLE_COMMANDS = {
+    "budget": _cmd_budget,
+    "minyear": _cmd_minyear,
+    "threshold": _cmd_threshold,
+    "radius": _cmd_radius,
+}
+
+# Not anchored to the start of the line: `becarscout run`'s log lines are
+# prefixed with a timestamp + level by logging.basicConfig (see cli.py's
+# main()) -- e.g. "2026-09-05 19:04:44 INFO score: 31 listings (...)" --
+# so this pulls out just the "stage: message" part the user actually cares
+# about and drops the noisy prefix.
+_SUMMARY_LINE_RE = re.compile(r"(?:scrape|structure|analyze|score|notify): .+")
+
+
+async def _cmd_find(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/find` — runs the full pipeline right now instead of waiting for
+    the next hourly cron tick. Shells out to `uv run becarscout run` (the
+    exact same command cron invokes) as a background subprocess rather
+    than calling `run_full_pipeline()` in-process: `do_analyze` blocks
+    synchronously per listing, and awaiting it directly here would freeze
+    this bot process — no button presses or other commands would work
+    until the whole run finished. A separate process is also exactly what
+    already happens every hour (cron's `run` and this `listen` process are
+    already two concurrent processes sharing the DB via WAL mode), so this
+    adds no new concurrency risk."""
+    if not update.effective_chat:
+        return
+    await _reply(update, "Starting a pipeline run now (scrape -> structure -> analyze -> score -> notify) "
+                          "-- this can take a few minutes, I'll message you when it's done.")
+    asyncio.create_task(_run_find_pipeline(update.effective_chat.id, update.get_bot()))
+
+
+async def _run_find_pipeline(chat_id: int, bot: Bot) -> None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "uv", "run", "becarscout", "run",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+    except Exception:
+        logger.exception("Failed to launch pipeline run for /find")
+        await bot.send_message(chat_id=chat_id, text="Couldn't start the pipeline run -- check the container logs.")
+        return
+
+    output = stdout.decode("utf-8", errors="replace") if stdout else ""
+    summary = [m.group(0) for line in output.splitlines() if (m := _SUMMARY_LINE_RE.search(line))]
+    if summary:
+        text = "Pipeline run finished:\n" + "\n".join(summary)
+    else:
+        text = f"Pipeline run finished (exit code {proc.returncode}) -- no summary found, check data/pipeline.log."
+    await bot.send_message(chat_id=chat_id, text=text)
+
+
+def _format_search_hit(row: ListingRow) -> str:
+    stats = []
+    if row.price_eur is not None:
+        stats.append(f"€{row.price_eur:,}")
+    if row.year is not None:
+        stats.append(str(row.year))
+    if row.mileage_km is not None:
+        stats.append(f"{row.mileage_km:,} km")
+    header = row.raw_title
+    if stats:
+        header += " -- " + " · ".join(stats)
+    score_line = f"Score: {row.score:+d}" if row.scored_at is not None else "Not yet scored"
+    return f"{header}\n{score_line}\n{row.url}"
+
+
+async def _cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/search <keyword>` — looks through listings already scraped and
+    structured for a make/model/title match, e.g. `/search golf` or
+    `/search bmw`. Doesn't scrape anything new -- see /find for that."""
+    keyword = " ".join(context.args or []).strip()
+    if not keyword:
+        await _reply(update, "Usage: /search <keyword> -- e.g. /search golf")
+        return
+
+    session = get_session()
+    try:
+        hits = repo.search_listings(session, keyword)
+    finally:
+        session.close()
+
+    if not hits:
+        await _reply(update, f"No listings matching \"{keyword}\" found among what's been scraped so far.")
+        return
+
+    lines = [f"{len(hits)} match{'es' if len(hits) != 1 else ''} for \"{keyword}\":", ""]
+    lines.append("\n\n".join(_format_search_hit(row) for row in hits))
+    await _reply(update, "\n".join(lines))
 
 
 async def _cmd_reviewfeedback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -341,16 +524,41 @@ async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     await _reply(update, "\n".join(lines))
 
 
+_BOT_COMMANDS = [
+    BotCommand("find", "Run the pipeline right now"),
+    BotCommand("search", "Search listings already scraped, e.g. /search golf"),
+    BotCommand("settings", "Show radius, budget, min year, threshold"),
+    BotCommand("budget", "Set your price range"),
+    BotCommand("minyear", "Set the oldest year to consider"),
+    BotCommand("threshold", "Set the minimum score to notify you"),
+    BotCommand("radius", "Set the search radius in km"),
+    BotCommand("reviewfeedback", "Review your thumbs up/down for patterns"),
+    BotCommand("validate", "Apply the last feedback review's suggestions"),
+]
+
+
+async def _post_init(application) -> None:
+    """Registers the command list Telegram shows as autocomplete
+    suggestions when you type "/" in the chat — purely a discoverability
+    aid, has no effect on which commands actually work."""
+    await application.bot.set_my_commands(_BOT_COMMANDS)
+
+
 def run_feedback_listener() -> None:
     """Blocks, polling for 👍/👎 button presses and commands until
     interrupted (Ctrl+C). Run this as a standing background process —
     `becarscout notify` only sends messages, it doesn't listen for
     replies or commands."""
     token, _ = _get_credentials()
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(token).post_init(_post_init).build()
     application.add_handler(
         CallbackQueryHandler(_handle_feedback_callback, pattern=rf"^{CALLBACK_PREFIX}:")
     )
+    application.add_handler(
+        CallbackQueryHandler(_handle_settings_callback, pattern=rf"^{SETTINGS_CALLBACK_PREFIX}:")
+    )
+    application.add_handler(CommandHandler("find", _cmd_find))
+    application.add_handler(CommandHandler("search", _cmd_search))
     application.add_handler(CommandHandler("settings", _cmd_settings))
     application.add_handler(CommandHandler("budget", _cmd_budget))
     application.add_handler(CommandHandler("minyear", _cmd_minyear))
@@ -358,5 +566,9 @@ def run_feedback_listener() -> None:
     application.add_handler(CommandHandler("radius", _cmd_radius))
     application.add_handler(CommandHandler("reviewfeedback", _cmd_reviewfeedback))
     application.add_handler(CommandHandler("validate", _cmd_validate))
+    # Must be added after every CommandHandler above -- filters.COMMAND
+    # excludes slash commands, but handler order still matters for any
+    # non-command text the other handlers don't claim.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_plain_reply))
     logger.info("Listening for feedback button presses and commands... (Ctrl+C to stop)")
     application.run_polling()

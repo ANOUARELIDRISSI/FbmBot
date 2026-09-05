@@ -174,3 +174,40 @@ def test_update_scoring_weights_twice_accumulates(session):
     weights = repo.get_scoring_weights(session)
     assert weights.accident_damage == -35
     assert weights.for_export == -20
+
+
+def test_search_listings_matches_make_model_or_title(session):
+    _make_row(session, "golf1", raw_title="VW Golf 7 TDI", make="Volkswagen", model_hint="Golf")
+    _make_row(session, "bmw1", raw_title="BMW 320d", make="BMW", model_hint="320d")
+    _make_row(session, "mystery", raw_title="Nice little golf cart", make=None, model_hint=None)
+
+    hits = repo.search_listings(session, "golf")
+
+    assert {row.listing_id for row in hits} == {"golf1", "mystery"}
+
+
+def test_search_listings_ignores_unstructured_listings(session):
+    _make_row(session, "structured", raw_title="Audi A3", make="Audi", model_hint="A3", structured_at=datetime.now(timezone.utc))
+    _make_row(session, "unstructured", raw_title="Audi A4", make="Audi", model_hint="A4", structured_at=None)
+
+    hits = repo.search_listings(session, "audi")
+
+    assert [row.listing_id for row in hits] == ["structured"]
+
+
+def test_search_listings_orders_by_score_then_recency(session):
+    _make_row(session, "low", raw_title="Opel Corsa low score", make="Opel", model_hint="Corsa", score=5)
+    _make_row(session, "high", raw_title="Opel Corsa high score", make="Opel", model_hint="Corsa", score=40)
+
+    hits = repo.search_listings(session, "corsa")
+
+    assert [row.listing_id for row in hits] == ["high", "low"]
+
+
+def test_search_listings_respects_limit(session):
+    for i in range(15):
+        _make_row(session, f"seat{i}", raw_title=f"Seat Leon {i}", make="Seat", model_hint="Leon")
+
+    hits = repo.search_listings(session, "leon", limit=5)
+
+    assert len(hits) == 5

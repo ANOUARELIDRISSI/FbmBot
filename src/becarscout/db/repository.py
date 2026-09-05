@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from becarscout.analyzer.models import DescriptionSignals
@@ -265,6 +265,33 @@ def get_scored_listing(session: Session, listing_id: str) -> ScoredListing | Non
     if row is None:
         return None
     return _row_to_scored(row)
+
+
+def search_listings(session: Session, keyword: str, limit: int = 10) -> list[ListingRow]:
+    """Backs Telegram's `/search` — a plain keyword match against make,
+    model, and the raw scraped title, over listings already structured
+    (so make/model exist to search at all). Ranked by score first (best
+    matches on top for anything already scored), then most recent —
+    unscored listings naturally fall after scored ones since `score`
+    defaults to 0."""
+    pattern = f"%{keyword}%"
+    return (
+        session.execute(
+            select(ListingRow)
+            .where(
+                ListingRow.structured_at.is_not(None),
+                or_(
+                    ListingRow.make.ilike(pattern),
+                    ListingRow.model_hint.ilike(pattern),
+                    ListingRow.raw_title.ilike(pattern),
+                ),
+            )
+            .order_by(ListingRow.score.desc(), ListingRow.scraped_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
 
 
 def get_unnotified_opportunities(session: Session) -> list[ScoredListing]:

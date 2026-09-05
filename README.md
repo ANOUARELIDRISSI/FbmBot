@@ -108,9 +108,18 @@ see the Telegram commands below for the step that does.
 ## Controlling it from Telegram
 
 Once `becarscout listen` is running (it's always running in Docker), these commands work
-straight from the chat — no SSH, no redeploy:
+straight from the chat — no SSH, no redeploy. Typing `/` in the chat shows all of them as
+autocomplete suggestions with a short description (registered via `setMyCommands` on
+startup — see `_post_init` in `notifier/bot.py`), so you don't need to remember the exact
+names.
 
-- `/settings` — shows the current radius, budget, min year, and score threshold at once.
+- `/find` — runs the full pipeline right now (scrape → structure → analyze → score →
+  notify) instead of waiting for the next hourly cron tick. Replies immediately, then
+  messages again with a summary once the run finishes (can take a few minutes).
+- `/search <keyword>` — looks through listings already scraped for a make/model/title
+  match, e.g. `/search golf`. Doesn't scrape anything new — see `/find` for that.
+- `/settings` — shows the current radius, budget, min year, and score threshold at once,
+  with buttons to change any of them.
 - `/budget <max>`, `/budget <min> <max>`, or `/budget off` — the price range future scrapes
   search within.
 - `/minyear <year>` or `/minyear off` — cars from that year or older never reach Telegram,
@@ -122,6 +131,10 @@ straight from the chat — no SSH, no redeploy:
 - `/validate` — applies the *last* `/reviewfeedback`'s suggestions for real. This is the
   only command that changes scoring behavior; everything else in stage 7 is advisory until
   you send this. Nothing is applied automatically, ever.
+
+`/budget`, `/minyear`, `/threshold`, and `/radius` also work as a two-step prompt: send the
+command with no arguments (or tap its button under `/settings`) and the bot asks for the
+value, then applies whatever you type next — no need to remember the exact argument syntax.
 
 Every setting above takes effect from the *next* scrape/score run onward — cron always
 invokes `becarscout run` with no flags, and it resolves each parameter as
