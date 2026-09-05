@@ -17,6 +17,7 @@ from becarscout.notifier.bot import (
     _quick_pick_keyboard,
     _search_range_keyboard,
     _summarize_find_output,
+    _welcome_text,
 )
 from becarscout.scoring.models import ScoredListing
 from becarscout.settings import PipelineSettings
@@ -192,3 +193,18 @@ def test_search_range_keyboard_has_one_button_per_range():
     buttons = keyboard.inline_keyboard[0]
     assert len(buttons) == len(_SEARCH_RANGE_DAYS)
     assert all(btn.callback_data.startswith("set:sr:") for btn in buttons)
+
+
+def test_welcome_text_greets_by_name_when_known():
+    text = _welcome_text("Badr")
+    assert "Hi Badr!" in text
+
+
+def test_welcome_text_falls_back_to_generic_greeting():
+    text = _welcome_text(None)
+    assert "Hi!" in text
+    assert "Hi None" not in text
+
+
+def test_name_is_promptable():
+    assert "name" in _PROMPTABLE_COMMANDS

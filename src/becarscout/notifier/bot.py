@@ -148,26 +148,30 @@ _SETTINGS_PROMPTS: dict[str, str] = {
         f"🔧 Automatic or manual? Type one: {', '.join(TRANSMISSIONS)}\n"
         "Or type off for no preference."
     ),
+    "name": "🙋 What should I call you?",
 }
 
-_WELCOME_TEXT = (
-    "👋 Hi! I'm BE-CarScout — I search Facebook Marketplace for used cars in Belgium "
-    "and message you here whenever I spot a good deal, just for you.\n\n"
-    "Tap 🚀 Quick setup below and I'll ask a few quick questions to get you started -- "
-    "or use /settings anytime to see and change:\n"
-    "💶 your budget\n"
-    "📅 the oldest year you'll consider\n"
-    "📍 how far I should search\n"
-    "🎯 how picky I should be\n"
-    "🛣️ 🚘 ⛽ 🔧 and filters for mileage, brand, fuel type, transmission\n\n"
-    "Other things I can do:\n"
-    "🔎 /find — search right now instead of waiting for the next hour\n"
-    "🔍 /search — look through cars I've already found, e.g. /search golf or /search today\n"
-    "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
-    "so I get better at picking cars for you over time\n"
-    "🚫 /cancel — stop whatever it's currently asking you\n\n"
-    "Type /settings anytime to see your current setup."
-)
+
+def _welcome_text(name: str | None) -> str:
+    greeting = f"👋 Hi {name}!" if name else "👋 Hi!"
+    return (
+        f"{greeting} I'm BE-CarScout — I search Facebook Marketplace for used cars in Belgium "
+        "and message you here whenever I spot a good deal, just for you.\n\n"
+        "Tap 🚀 Quick setup below and I'll ask a few quick questions to get you started -- "
+        "or use /settings anytime to see and change:\n"
+        "💶 your budget\n"
+        "📅 the oldest year you'll consider\n"
+        "📍 how far I should search\n"
+        "🎯 how picky I should be\n"
+        "🛣️ 🚘 ⛽ 🔧 and filters for mileage, brand, fuel type, transmission\n\n"
+        "Other things I can do:\n"
+        "🔎 /find — search right now instead of waiting for the next hour\n"
+        "🔍 /search — look through cars I've already found, e.g. /search golf or /search today\n"
+        "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
+        "so I get better at picking cars for you over time\n"
+        "🚫 /cancel — stop whatever it's currently asking you\n\n"
+        "Type /settings anytime to see your current setup."
+    )
 
 # python-telegram-bot's defaults (5s connect/read, 1s pool timeout) are too
 # tight for a container's network path — a single slow DNS lookup or a
@@ -379,11 +383,14 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("🙋 Name", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:name"),
                 InlineKeyboardButton("💰 Budget", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:budget"),
-                InlineKeyboardButton("📅 Min year", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:minyear"),
             ],
             [
+                InlineKeyboardButton("📅 Min year", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:minyear"),
                 InlineKeyboardButton("🎯 Threshold", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:threshold"),
+            ],
+            [
                 InlineKeyboardButton("📍 Radius", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:radius"),
             ],
             [
@@ -412,6 +419,7 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         settings = repo.get_pipeline_settings(session, chat.id)
         radius_km = repo.get_global_scrape_radius_km(session)
+        name = repo.get_subscriber_name(session, chat.id)
     finally:
         session.close()
     min_year_text = str(settings.min_year) if settings.min_year is not None else "any year"
@@ -422,6 +430,7 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     await _reply(
         update,
         "⚙️ Your current setup:\n\n"
+        f"🙋 Name: {name or 'not set'}\n"
         f"💶 Budget: {_budget_text(settings)}\n"
         f"📅 Oldest year I'll consider: {min_year_text}\n"
         f"📍 Search area (shared): {radius_km} km around each city\n"
@@ -854,10 +863,47 @@ async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return True
 
 
+async def _cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """`/name <text>` sets what this subscriber wants to be called. A
+    brand-new chat is asked this before anything else (see `_cmd_start`)
+    -- answering it here is what unlocks the full welcome message and
+    Quick setup button, same as if they'd typed `/start` after already
+    having a name on file."""
+    chat = update.effective_chat
+    if not chat:
+        return False
+    args = context.args or []
+    session = get_session()
+    try:
+        if not args:
+            current = repo.get_subscriber_name(session, chat.id)
+            _pending_prompts[chat.id] = "name"
+            if current:
+                await _reply(update, f"Right now I call you {current}.\n\n{_SETTINGS_PROMPTS['name']}")
+            else:
+                await _reply(update, _SETTINGS_PROMPTS["name"])
+            return False
+
+        name = " ".join(args).strip()
+        if not name:
+            await _reply(update, "That doesn't look like a name -- try typing it again.")
+            return False
+        first_time = repo.get_subscriber_name(session, chat.id) is None
+        repo.set_subscriber_name(session, chat.id, name)
+    finally:
+        session.close()
+
+    await _reply(update, f"✅ Got it, I'll call you {name}.")
+    if first_time:
+        await _reply(update, _welcome_text(name), reply_markup=_QUICK_SETUP_KEYBOARD)
+    return True
+
+
 # Maps a pending-prompt key (see _SETTINGS_PROMPTS) to the same handler its
 # matching /command uses — defined after all four exist so _handle_plain_reply
 # and the /settings buttons can dispatch to them without duplicating logic.
 _PROMPTABLE_COMMANDS = {
+    "name": _cmd_name,
     "budget": _cmd_budget,
     "minyear": _cmd_minyear,
     "threshold": _cmd_threshold,
@@ -1083,6 +1129,7 @@ async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
 _BOT_COMMANDS = [
     BotCommand("start", "What I do and how to set me up"),
     BotCommand("setup", "Quick guided setup (budget, year, area, pickiness)"),
+    BotCommand("name", "Tell me what to call you"),
     BotCommand("find", "Search for cars right now"),
     BotCommand("search", "Look through cars I've already found, e.g. /search golf"),
     BotCommand("settings", "See and change your budget, year, area, pickiness"),
@@ -1108,8 +1155,24 @@ _QUICK_SETUP_KEYBOARD = InlineKeyboardMarkup(
 async def _cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/start` (Telegram's standard first-contact command) and `/help` —
     a plain-language welcome explaining what the bot does and how to set
-    it up, for anyone who isn't already familiar with the command names."""
-    await _reply(update, _WELCOME_TEXT, reply_markup=_QUICK_SETUP_KEYBOARD)
+    it up. A chat with no name on file yet is asked for one *first* --
+    `_cmd_name` sends the full welcome (this same text) once they answer,
+    so `/help` from a chat that already has a name just shows it again."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    session = get_session()
+    try:
+        name = repo.get_subscriber_name(session, chat.id)
+    finally:
+        session.close()
+
+    if name is None:
+        _pending_prompts[chat.id] = "name"
+        await _reply(update, "👋 Hi! I'm BE-CarScout. Before anything else -- what should I call you?")
+        return
+
+    await _reply(update, _welcome_text(name), reply_markup=_QUICK_SETUP_KEYBOARD)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,6 +1222,7 @@ def run_feedback_listener() -> None:
     application.add_handler(CommandHandler("find", _cmd_find))
     application.add_handler(CommandHandler("search", _cmd_search))
     application.add_handler(CommandHandler("settings", _cmd_settings))
+    application.add_handler(CommandHandler("name", _cmd_name))
     application.add_handler(CommandHandler("budget", _cmd_budget))
     application.add_handler(CommandHandler("minyear", _cmd_minyear))
     application.add_handler(CommandHandler("threshold", _cmd_threshold))

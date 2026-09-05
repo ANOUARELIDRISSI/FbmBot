@@ -168,6 +168,7 @@ def _ensure_initialized() -> None:
     _ensure_column(_engine, "pipeline_settings", "transmission", "TEXT")
     _ensure_column(_engine, "pipeline_settings", "chat_id", "BIGINT")
     _ensure_column(_engine, "scoring_weights", "chat_id", "BIGINT")
+    _ensure_column(_engine, "subscribers", "name", "TEXT")
     _migrate_singleuser_to_subscriber(_engine)
     _SessionLocal = sessionmaker(bind=_engine)
 

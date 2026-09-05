@@ -145,9 +145,11 @@ notifications, and feedback are yours alone — **except `/radius`**, which is s
 everyone using this bot (there's no per-listing distance figure to filter by afterward, so
 one radius has to define what gets scraped for everyone; see Project.md).
 
-- `/start` or `/help` — a plain-language welcome message explaining what the bot does and
-  how to set it up, with a "🚀 Quick setup" button. Sending this (or really any message)
-  also subscribes you — no separate registration step.
+- `/start` or `/help` — for a brand-new chat, asks what to call you *before* anything
+  else; once you answer, shows the plain-language welcome message with a "🚀 Quick setup"
+  button. Sending this (or really any message) also subscribes you — no separate
+  registration step. Already have a name on file? `/start`/`/help` just greets you by it.
+- `/name <text>` — change what the bot calls you anytime, or see it under `/settings`.
 - `/setup` — a guided flow through the four core settings (budget, min year, radius,
   threshold) one question at a time, instead of tapping four separate `/settings` buttons.
 - `/cancel` — stops whatever it's currently asking you (a pending prompt or an in-progress

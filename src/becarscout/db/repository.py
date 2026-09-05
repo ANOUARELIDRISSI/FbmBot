@@ -454,6 +454,23 @@ def ensure_subscriber(session: Session, chat_id: int) -> None:
         session.commit()
 
 
+def get_subscriber_name(session: Session, chat_id: int) -> str | None:
+    """What this subscriber has told the bot to call them (`/name`) —
+    None if they've never set one (a brand-new chat is asked for it
+    before anything else, see `/start`)."""
+    row = session.get(SubscriberRow, chat_id)
+    return row.name if row is not None else None
+
+
+def set_subscriber_name(session: Session, chat_id: int, name: str) -> None:
+    row = session.get(SubscriberRow, chat_id)
+    if row is None:
+        row = SubscriberRow(chat_id=chat_id, created_at=_now())
+        session.add(row)
+    row.name = name
+    session.commit()
+
+
 def get_global_scrape_radius_km(session: Session) -> int:
     row = session.get(GlobalScrapeSettingsRow, 1)
     return row.radius_km if row is not None else DEFAULT_RADIUS_KM

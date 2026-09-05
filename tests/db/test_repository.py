@@ -244,6 +244,41 @@ def test_get_subscribers_returns_everyone(session):
     assert set(repo.get_subscribers(session)) == {CHAT_A, CHAT_B}
 
 
+def test_get_subscriber_name_defaults_to_none(session):
+    assert repo.get_subscriber_name(session, CHAT_A) is None
+
+
+def test_set_subscriber_name_before_ensure_subscriber_still_works(session):
+    # /start asks for a name before anything else runs -- the
+    # subscribed-middleware has already created the row by then in
+    # practice, but set_subscriber_name shouldn't depend on that order.
+    repo.set_subscriber_name(session, CHAT_A, "Badr")
+    assert repo.get_subscriber_name(session, CHAT_A) == "Badr"
+
+
+def test_set_subscriber_name_after_ensure_subscriber(session):
+    repo.ensure_subscriber(session, CHAT_A)
+    repo.set_subscriber_name(session, CHAT_A, "Badr")
+
+    assert repo.get_subscriber_name(session, CHAT_A) == "Badr"
+    assert repo.get_subscribers(session) == [CHAT_A]  # still just one row, not duplicated
+
+
+def test_subscriber_names_are_isolated_per_chat(session):
+    repo.set_subscriber_name(session, CHAT_A, "Badr")
+    repo.set_subscriber_name(session, CHAT_B, "Sam")
+
+    assert repo.get_subscriber_name(session, CHAT_A) == "Badr"
+    assert repo.get_subscriber_name(session, CHAT_B) == "Sam"
+
+
+def test_set_subscriber_name_can_be_changed(session):
+    repo.set_subscriber_name(session, CHAT_A, "Badr")
+    repo.set_subscriber_name(session, CHAT_A, "B")
+
+    assert repo.get_subscriber_name(session, CHAT_A) == "B"
+
+
 # --- global scrape radius (shared) ---
 
 

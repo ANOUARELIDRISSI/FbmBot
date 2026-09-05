@@ -102,6 +102,10 @@ class SubscriberRow(Base):
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    name: Mapped[str | None] = mapped_column(String, nullable=True)
+    """What they've told the bot to call them (`/name`) -- added after
+    this table's first deployment, see `_ensure_column`. None until they
+    answer the name prompt `/start` leads with for a brand-new chat."""
 
 
 class UserListingScoreRow(Base):
