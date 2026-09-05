@@ -13,9 +13,10 @@ from pathlib import Path
 DEFAULT_FEEDBACK_PATH = Path("data/feedback/feedback.jsonl")
 
 
-def record_feedback(listing_id: str, verdict: str, path: Path = DEFAULT_FEEDBACK_PATH) -> None:
+def record_feedback(chat_id: int, listing_id: str, verdict: str, path: Path = DEFAULT_FEEDBACK_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
+        "chat_id": chat_id,
         "listing_id": listing_id,
         "verdict": verdict,
         "recorded_at": datetime.now(timezone.utc).isoformat(),

@@ -4,6 +4,14 @@ picker UI for a different, unrelated product idea (brand/model selection
 via chat, seller negotiation, KBB pricing). What Project.md actually specs
 for this stage is much simpler: push a card per opportunity with inline
 👍/👎, nothing more.
+
+Multi-user note (added 2026-09-06): every chat that has ever messaged the
+bot is a subscriber (`_ensure_subscribed_middleware`, a `group=-1` handler
+that runs before everything else) with their own budget/year/threshold/
+mileage/brand/fuel/transmission, their own scores, and their own feedback
+memory — see `db/models.py`'s module docstring. Search radius is the one
+setting still shared by everyone (`/radius`), since there's no per-listing
+distance figure to filter by afterward.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ import contextlib
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -23,6 +32,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
@@ -66,6 +76,12 @@ _WIZARD_STEPS = ["budget", "minyear", "radius", "threshold"]
 # one already going.
 _find_running: set[int] = set()
 
+# Chat id -> the last keyword it searched for -- lets the /search time-range
+# quick-pick buttons ("Today"/"2 days"/...) re-run the same search with a
+# range applied without re-encoding the keyword into callback_data (which
+# has a 64-byte limit and awkward separator rules).
+_last_search_keyword: dict[int, str] = {}
+
 _QUICK_PICKS: dict[str, dict[str, dict[str, object]]] = {
     "threshold": {
         "loose": {"threshold": 10},
@@ -83,6 +99,14 @@ _QUICK_PICK_LABELS: dict[str, list[tuple[str, str]]] = {
     "threshold": [("loose", "😌 Loose"), ("balanced", "⚖️ Balanced"), ("strict", "🔥 Strict")],
     "budget": [("under5k", "Under €5,000"), ("5to15k", "€5,000-15,000"), ("15kplus", "€15,000+")],
 }
+
+_SEARCH_RANGE_DAYS: dict[str, int] = {"today": 1, "2days": 2, "3days": 3, "week": 7}
+_SEARCH_RANGE_LABELS: list[tuple[str, str]] = [
+    ("today", "📅 Today"),
+    ("2days", "📅 2 days"),
+    ("3days", "📅 3 days"),
+    ("week", "📅 Last week"),
+]
 
 _SETTINGS_PROMPTS: dict[str, str] = {
     "budget": (
@@ -103,7 +127,8 @@ _SETTINGS_PROMPTS: dict[str, str] = {
     ),
     "radius": (
         "📍 How far should I search around each city?\n"
-        "Type a distance in km, like 100."
+        "Type a distance in km, like 100.\n"
+        "Heads up: this changes the search area for everyone using this bot, not just you."
     ),
     "mileage": (
         "🛣️ What's the highest mileage you'll accept?\n"
@@ -127,7 +152,7 @@ _SETTINGS_PROMPTS: dict[str, str] = {
 
 _WELCOME_TEXT = (
     "👋 Hi! I'm BE-CarScout — I search Facebook Marketplace for used cars in Belgium "
-    "and message you here whenever I spot a good deal.\n\n"
+    "and message you here whenever I spot a good deal, just for you.\n\n"
     "Tap 🚀 Quick setup below and I'll ask a few quick questions to get you started -- "
     "or use /settings anytime to see and change:\n"
     "💶 your budget\n"
@@ -137,7 +162,7 @@ _WELCOME_TEXT = (
     "🛣️ 🚘 ⛽ 🔧 and filters for mileage, brand, fuel type, transmission\n\n"
     "Other things I can do:\n"
     "🔎 /find — search right now instead of waiting for the next hour\n"
-    "🔍 /search — look through cars I've already found, e.g. /search golf\n"
+    "🔍 /search — look through cars I've already found, e.g. /search golf or /search today\n"
     "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
     "so I get better at picking cars for you over time\n"
     "🚫 /cancel — stop whatever it's currently asking you\n\n"
@@ -157,24 +182,21 @@ def _build_bot(token: str) -> Bot:
     return Bot(token=token, request=HTTPXRequest(**_REQUEST_TIMEOUTS))
 
 
-def _get_credentials() -> tuple[str, str]:
+def _get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set in .env")
-    return token, chat_id
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
+    return token
 
 
 async def find_chat_ids() -> list[tuple[int, str]]:
     """Looks at recent messages the bot has received (getUpdates) and
-    returns (chat_id, sender_description) pairs — used to find your own
-    chat_id after you've sent the bot a message, without needing to call
-    the Telegram API by hand."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN must be set in .env")
-
-    bot = _build_bot(token)
+    returns (chat_id, sender_description) pairs — a quick way to find a
+    chat_id for CLI/admin use (e.g. `becarscout feedback-review
+    --chat-id`) without needing to call the Telegram API by hand.
+    Subscribing itself no longer needs this — see
+    `_ensure_subscribed_middleware`."""
+    bot = _build_bot(_get_token())
     seen: dict[int, str] = {}
     async with bot:
         updates = await bot.get_updates()
@@ -198,18 +220,18 @@ def _keyboard(listing_id: str) -> InlineKeyboardMarkup:
     )
 
 
-async def send_new_opportunities(opportunities: list[ScoredListing]) -> list[str]:
-    """Sends every opportunity given (the caller — the DB-backed `notify`
-    stage — is what decides which ones haven't been sent yet). Returns the
-    listing_ids that actually went out, so the caller can mark only those
-    as notified; one failed send shouldn't be recorded as delivered.
+async def send_new_opportunities(chat_id: int, opportunities: list[ScoredListing]) -> list[str]:
+    """Sends every opportunity given to one subscriber (the caller — the
+    DB-backed `notify` stage — is what decides which ones haven't been
+    sent to *this* chat_id yet). Returns the listing_ids that actually
+    went out, so the caller can mark only those as notified; one failed
+    send shouldn't be recorded as delivered.
 
     Retries the whole connection (not just individual sends) on failure,
     since a `TimedOut` during `Bot.initialize()` means nothing has sent
     yet — but tracks what *did* go out across attempts so a retry after a
     partial batch never double-sends."""
-    token, chat_id = _get_credentials()
-    bot = _build_bot(token)
+    bot = _build_bot(_get_token())
     sent_ids: list[str] = []
 
     for attempt, delay in enumerate((0, *_CONNECT_RETRY_DELAYS_S)):
@@ -221,7 +243,7 @@ async def send_new_opportunities(opportunities: list[ScoredListing]) -> list[str
                     if listing.listing_id in sent_ids:
                         continue
                     try:
-                        similar_feedback = find_similar_feedback(listing)
+                        similar_feedback = find_similar_feedback(listing, chat_id)
                         await bot.send_message(
                             chat_id=chat_id,
                             text=format_opportunity_message(listing, similar_feedback),
@@ -238,17 +260,33 @@ async def send_new_opportunities(opportunities: list[ScoredListing]) -> list[str
     return sent_ids
 
 
-def _fetch_scored_listing(listing_id: str) -> ScoredListing | None:
+def _fetch_scored_listing(chat_id: int, listing_id: str) -> ScoredListing | None:
     session = get_session()
     try:
-        return repo.get_scored_listing(session, listing_id)
+        return repo.get_scored_listing(session, chat_id, listing_id)
+    finally:
+        session.close()
+
+
+async def _ensure_subscribed_middleware(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler (registered with `group=-1`), so
+    any chat that has ever sent the bot anything becomes a subscriber —
+    notifications and settings don't depend on remembering to send
+    `/start` specifically. A no-op for an already-known chat."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    session = get_session()
+    try:
+        repo.ensure_subscriber(session, chat.id)
     finally:
         session.close()
 
 
 async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query or not query.data:
+    chat = update.effective_chat
+    if not query or not query.data or not chat:
         return
     await query.answer()
 
@@ -262,7 +300,7 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
         # Not feedback — just reveals the full point-by-point breakdown
         # kept out of the default card (see formatting.py). Leaves the
         # buttons in place so 👍/👎 is still available afterwards.
-        scored = _fetch_scored_listing(listing_id)
+        scored = _fetch_scored_listing(chat.id, listing_id)
         if scored is not None and query.message:
             try:
                 await query.message.reply_text(format_score_explanation(scored))
@@ -270,12 +308,12 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
                 logger.exception("Failed to send score explanation for %s", listing_id)
         return
 
-    record_feedback(listing_id, verdict)
-    scored = _fetch_scored_listing(listing_id)
+    record_feedback(chat.id, listing_id, verdict)
+    scored = _fetch_scored_listing(chat.id, listing_id)
     if scored is not None:
-        store_feedback_memory(scored, verdict)
+        store_feedback_memory(scored, verdict, chat.id)
     else:
-        logger.warning("No DB row for %s — feedback.jsonl has it, but mem0 couldn't store context for it", listing_id)
+        logger.warning("No score for %s/%s — feedback.jsonl has it, but mem0 couldn't store context for it", chat.id, listing_id)
 
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -329,6 +367,14 @@ def _quick_pick_keyboard(setting: str) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup([buttons])
 
 
+def _search_range_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"{SETTINGS_CALLBACK_PREFIX}:sr:{key}")
+        for key, label in _SEARCH_RANGE_LABELS
+    ]
+    return InlineKeyboardMarkup([buttons])
+
+
 def _settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -356,10 +402,16 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     """`/settings` — shows every parameter the other commands below can
     change, in one place, since each of them only shows/changes its own.
     Tapping a button below prompts for the new value, same as sending the
-    matching command with no arguments."""
+    matching command with no arguments. Everything here is personal to
+    this chat except the search radius, which is shared by every
+    subscriber (see module docstring)."""
+    chat = update.effective_chat
+    if not chat:
+        return
     session = get_session()
     try:
-        settings = repo.get_pipeline_settings(session)
+        settings = repo.get_pipeline_settings(session, chat.id)
+        radius_km = repo.get_global_scrape_radius_km(session)
     finally:
         session.close()
     min_year_text = str(settings.min_year) if settings.min_year is not None else "any year"
@@ -372,7 +424,7 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
         "⚙️ Your current setup:\n\n"
         f"💶 Budget: {_budget_text(settings)}\n"
         f"📅 Oldest year I'll consider: {min_year_text}\n"
-        f"📍 Search area: {settings.radius_km} km around each city\n"
+        f"📍 Search area (shared): {radius_km} km around each city\n"
         f"🎯 How picky I am: {settings.threshold} (higher = fewer, better matches)\n"
         f"🛣️ Highest mileage: {mileage_text}\n"
         f"🚘 Brands: {makes_text}\n"
@@ -420,18 +472,19 @@ async def _handle_quick_pick(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """Handles a one-tap quick-pick button (see `_QUICK_PICKS`) -- applies
     the change directly rather than routing through a /command's text
     parsing, since these buttons carry their own fixed values."""
+    chat = update.effective_chat
+    if not chat:
+        return
     changes = _QUICK_PICKS.get(setting, {}).get(key)
     if changes is None:
         return
     session = get_session()
     try:
-        settings = repo.update_pipeline_settings(session, **changes)
+        settings = repo.update_pipeline_settings(session, chat.id, **changes)
     finally:
         session.close()
 
-    chat = update.effective_chat
-    if chat:
-        _pending_prompts.pop(chat.id, None)
+    _pending_prompts.pop(chat.id, None)
 
     if setting == "threshold":
         text = f"✅ Got it — I'll only message you about cars that score {settings.threshold} or higher."
@@ -439,8 +492,19 @@ async def _handle_quick_pick(update: Update, context: ContextTypes.DEFAULT_TYPE,
         text = f"✅ Budget set: {_budget_text(settings)}"
     await _reply(update, f"{text}\nThis applies from your next search onward.")
 
-    if chat:
-        await _advance_wizard(chat.id, update, context)
+    await _advance_wizard(chat.id, update, context)
+
+
+async def _handle_search_range(update: Update, context: ContextTypes.DEFAULT_TYPE, range_key: str) -> None:
+    """Handles a tap on one of `/search`'s time-range quick-pick buttons
+    -- re-runs the chat's last search (or, if it never searched a
+    keyword, just lists what's new) restricted to that window."""
+    chat = update.effective_chat
+    if not chat or range_key not in _SEARCH_RANGE_DAYS:
+        return
+    keyword = _last_search_keyword.get(chat.id, "")
+    context.args = (keyword.split() if keyword else []) + [range_key]
+    await _cmd_search(update, context)
 
 
 async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,6 +519,10 @@ async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAUL
 
     if len(parts) == 4 and parts[1] == "qp":
         await _handle_quick_pick(update, context, parts[2], parts[3])
+        return
+
+    if len(parts) == 3 and parts[1] == "sr":
+        await _handle_search_range(update, context, parts[2])
         return
 
     if len(parts) != 2:
@@ -512,18 +580,22 @@ async def _handle_plain_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/budget` — sets the price range future scrapes search within.
-    `/budget 15000` sets a max only; `/budget 3000 15000` sets both;
-    `/budget off` clears it entirely. Returns whether a value was actually
-    applied (used by `_handle_plain_reply`/`_advance_wizard` to know
-    whether to move on or keep the prompt armed for a retry)."""
+    """`/budget` — this subscriber's personal price range. `/budget 15000`
+    sets a max only; `/budget 3000 15000` sets both; `/budget off` clears
+    it entirely. A shared pool of listings is scraped for everyone (see
+    `/radius`); this filters what you personally get notified about.
+    Returns whether a value was actually applied (used by
+    `_handle_plain_reply`/`_advance_wizard` to know whether to move on or
+    keep the prompt armed for a retry)."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "budget"
+            settings = repo.get_pipeline_settings(session, chat.id)
+            _pending_prompts[chat.id] = "budget"
             await _reply(
                 update,
                 f"Your budget is currently: {_budget_text(settings)}\n\n{_SETTINGS_PROMPTS['budget']}",
@@ -532,19 +604,19 @@ async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, min_price=None, max_price=None)
+            settings = repo.update_pipeline_settings(session, chat.id, min_price=None, max_price=None)
         elif len(args) == 1:
             max_price = _parse_int_arg(args[0])
             if max_price is None:
                 await _reply(update, "That doesn't look like a number. Try just a number, like 15000.")
                 return False
-            settings = repo.update_pipeline_settings(session, max_price=max_price)
+            settings = repo.update_pipeline_settings(session, chat.id, max_price=max_price)
         else:
             min_price, max_price = _parse_int_arg(args[0]), _parse_int_arg(args[1])
             if min_price is None or max_price is None:
                 await _reply(update, "Those don't look like numbers. Try two numbers, like 3000 15000.")
                 return False
-            settings = repo.update_pipeline_settings(session, min_price=min_price, max_price=max_price)
+            settings = repo.update_pipeline_settings(session, chat.id, min_price=min_price, max_price=max_price)
     finally:
         session.close()
     await _reply(update, f"✅ Budget set: {_budget_text(settings)}\nThis applies from your next search onward.")
@@ -553,26 +625,28 @@ async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/minyear 2015` excludes cars from that year or older regardless
-    of score; `/minyear off` disables the cutoff entirely."""
+    of score, for this subscriber; `/minyear off` disables the cutoff."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
+            settings = repo.get_pipeline_settings(session, chat.id)
             current = str(settings.min_year) if settings.min_year is not None else "any year"
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "minyear"
+            _pending_prompts[chat.id] = "minyear"
             await _reply(update, f"Right now I'll consider cars from: {current}\n\n{_SETTINGS_PROMPTS['minyear']}")
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, min_year=None)
+            settings = repo.update_pipeline_settings(session, chat.id, min_year=None)
         else:
             year = _parse_int_arg(args[0])
             if year is None:
                 await _reply(update, "That doesn't look like a year. Try a number like 2015.")
                 return False
-            settings = repo.update_pipeline_settings(session, min_year=year)
+            settings = repo.update_pipeline_settings(session, chat.id, min_year=year)
     finally:
         session.close()
     confirmation = (
@@ -585,15 +659,17 @@ async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 
 async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/threshold 30` — a listing needs at least this score to reach
-    Telegram; higher means fewer, more confident opportunities."""
+    """`/threshold 30` — a listing needs at least this score to reach this
+    subscriber; higher means fewer, more confident opportunities."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "threshold"
+            settings = repo.get_pipeline_settings(session, chat.id)
+            _pending_prompts[chat.id] = "threshold"
             await _reply(
                 update,
                 f"Right now, how picky I am: {settings.threshold}\n\n{_SETTINGS_PROMPTS['threshold']}",
@@ -604,7 +680,7 @@ async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if value is None:
             await _reply(update, "That doesn't look like a number. Try a number like 20.")
             return False
-        settings = repo.update_pipeline_settings(session, threshold=value)
+        settings = repo.update_pipeline_settings(session, chat.id, threshold=value)
     finally:
         session.close()
     await _reply(update, f"✅ Got it — I'll only message you about cars that score {settings.threshold} or higher.\nThis applies from your next search onward.")
@@ -612,50 +688,58 @@ async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/radius 150` — search radius in km around each Belgian hub city."""
+    """`/radius 150` — search radius in km around each Belgian hub city.
+    Unlike every other filter, this is shared by every subscriber: there's
+    no per-listing distance figure to filter by after the fact, so one
+    radius has to define what's scraped for everyone."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "radius"
-            await _reply(update, f"Right now I search {settings.radius_km} km around each city.\n\n{_SETTINGS_PROMPTS['radius']}")
+            radius_km = repo.get_global_scrape_radius_km(session)
+            _pending_prompts[chat.id] = "radius"
+            await _reply(update, f"Right now everyone's search covers {radius_km} km around each city.\n\n{_SETTINGS_PROMPTS['radius']}")
             return False
         km = _parse_int_arg(args[0])
         if km is None or km <= 0:
             await _reply(update, "That doesn't look like a distance. Try a positive number like 100.")
             return False
-        settings = repo.update_pipeline_settings(session, radius_km=km)
+        radius_km = repo.update_global_scrape_radius_km(session, km)
     finally:
         session.close()
-    await _reply(update, f"✅ I'll now search {settings.radius_km} km around each city.\nThis applies from your next search onward.")
+    await _reply(update, f"✅ The shared search now covers {radius_km} km around each city.\nThis applies from the next search onward, for everyone.")
     return True
 
 
 async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/mileage 150000` excludes cars with more km than that regardless
-    of score; `/mileage off` disables the cutoff. A listing with no
-    detected mileage still passes -- see `scoring/gate.py`'s docstring."""
+    of score, for this subscriber; `/mileage off` disables the cutoff. A
+    listing with no detected mileage still passes -- see
+    `scoring/gate.py`'s docstring."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
+            settings = repo.get_pipeline_settings(session, chat.id)
             current = f"{settings.max_mileage_km:,} km" if settings.max_mileage_km is not None else "no limit"
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "mileage"
+            _pending_prompts[chat.id] = "mileage"
             await _reply(update, f"Right now, highest mileage I'll accept: {current}\n\n{_SETTINGS_PROMPTS['mileage']}")
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, max_mileage_km=None)
+            settings = repo.update_pipeline_settings(session, chat.id, max_mileage_km=None)
         else:
             km = _parse_int_arg(args[0])
             if km is None or km <= 0:
                 await _reply(update, "That doesn't look like a distance. Try a positive number like 150000.")
                 return False
-            settings = repo.update_pipeline_settings(session, max_mileage_km=km)
+            settings = repo.update_pipeline_settings(session, chat.id, max_mileage_km=km)
     finally:
         session.close()
     confirmation = (
@@ -668,23 +752,25 @@ async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
 
 async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/make bmw, toyota` only shows those brands; `/make off` clears
-    it. Unlike /mileage or /minyear, a listing whose brand wasn't
-    detected does *not* pass once this filter is set -- see
+    """`/make bmw, toyota` only shows this subscriber those brands;
+    `/make off` clears it. Unlike /mileage or /minyear, a listing whose
+    brand wasn't detected does *not* pass once this filter is set -- see
     `scoring/gate.py`'s docstring for why."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
+            settings = repo.get_pipeline_settings(session, chat.id)
             current = settings.makes.replace(",", ", ") if settings.makes else "any brand"
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "make"
+            _pending_prompts[chat.id] = "make"
             await _reply(update, f"Right now, brands I'll show you: {current}\n\n{_SETTINGS_PROMPTS['make']}")
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, makes=None)
+            settings = repo.update_pipeline_settings(session, chat.id, makes=None)
         else:
             wanted = _parse_csv_arg(args)
             if not wanted:
@@ -692,7 +778,7 @@ async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
                 return False
             known = {m.lower() for m in MAKES}
             unknown = [m for m in wanted if m not in known]
-            settings = repo.update_pipeline_settings(session, makes=",".join(wanted))
+            settings = repo.update_pipeline_settings(session, chat.id, makes=",".join(wanted))
             if unknown:
                 await _reply(update, f"⚠️ Heads up, I don't recognize \"{', '.join(unknown)}\" as a brand -- double-check the spelling, or it just won't match anything.")
     finally:
@@ -703,29 +789,32 @@ async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/fuel diesel, hybrid` only shows those fuel types; `/fuel off`
-    clears it. Strict about valid values (unlike /make) since the set of
-    real fuel types is small and fixed -- see `structurer.parse.FUEL_TYPES`."""
+    """`/fuel diesel, hybrid` only shows this subscriber those fuel types;
+    `/fuel off` clears it. Strict about valid values (unlike /make) since
+    the set of real fuel types is small and fixed -- see
+    `structurer.parse.FUEL_TYPES`."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
+            settings = repo.get_pipeline_settings(session, chat.id)
             current = settings.fuel_types.replace(",", ", ") if settings.fuel_types else "any fuel type"
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "fuel"
+            _pending_prompts[chat.id] = "fuel"
             await _reply(update, f"Right now, fuel types I'll show you: {current}\n\n{_SETTINGS_PROMPTS['fuel']}")
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, fuel_types=None)
+            settings = repo.update_pipeline_settings(session, chat.id, fuel_types=None)
         else:
             wanted = _parse_csv_arg(args)
             invalid = [f for f in wanted if f not in FUEL_TYPES]
             if invalid:
                 await _reply(update, f"I don't recognize \"{', '.join(invalid)}\". Valid options: {', '.join(FUEL_TYPES)}")
                 return False
-            settings = repo.update_pipeline_settings(session, fuel_types=",".join(wanted))
+            settings = repo.update_pipeline_settings(session, chat.id, fuel_types=",".join(wanted))
     finally:
         session.close()
     confirmation = f"✅ I'll only show you: {settings.fuel_types.replace(',', ', ')}" if settings.fuel_types else "✅ I'll show you any fuel type again."
@@ -734,27 +823,30 @@ async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """`/transmission automatic` or `/transmission manual`; `/transmission
-    off` clears it. Same strict-values reasoning as /fuel."""
+    """`/transmission automatic` or `/transmission manual`, for this
+    subscriber; `/transmission off` clears it. Same strict-values
+    reasoning as /fuel."""
+    chat = update.effective_chat
+    if not chat:
+        return False
     args = context.args or []
     session = get_session()
     try:
         if not args:
-            settings = repo.get_pipeline_settings(session)
+            settings = repo.get_pipeline_settings(session, chat.id)
             current = settings.transmission or "no preference"
-            if update.effective_chat:
-                _pending_prompts[update.effective_chat.id] = "transmission"
+            _pending_prompts[chat.id] = "transmission"
             await _reply(update, f"Right now: {current}\n\n{_SETTINGS_PROMPTS['transmission']}")
             return False
 
         if args[0].lower() == "off":
-            settings = repo.update_pipeline_settings(session, transmission=None)
+            settings = repo.update_pipeline_settings(session, chat.id, transmission=None)
         else:
             wanted = args[0].strip().lower()
             if wanted not in TRANSMISSIONS:
                 await _reply(update, f"I don't recognize \"{wanted}\". Valid options: {', '.join(TRANSMISSIONS)}")
                 return False
-            settings = repo.update_pipeline_settings(session, transmission=wanted)
+            settings = repo.update_pipeline_settings(session, chat.id, transmission=wanted)
     finally:
         session.close()
     confirmation = f"✅ I'll only show you: {settings.transmission}" if settings.transmission else "✅ No preference anymore."
@@ -779,7 +871,9 @@ _PROMPTABLE_COMMANDS = {
 # `becarscout run`'s log lines carry a timestamp + level prefix (see
 # cli.py's main()) followed by one of these fixed messages per stage --
 # used to translate the raw log into a plain-English summary instead of
-# showing internal stage names to a non-technical user.
+# showing internal stage names to a non-technical user. score/notify's
+# numbers are totals across every subscriber (the run refreshes results
+# for everyone, not just whoever typed /find).
 _SCRAPE_RE = re.compile(r"scrape: (\d+) new listings, (\d+) price changes")
 _SCORE_RE = re.compile(r"score: (\d+) listings \((\d+) opportunities\)")
 _NOTIFY_RE = re.compile(r"notify: (\d+) sent")
@@ -819,7 +913,9 @@ async def _cmd_find(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     until the whole run finished. A separate process is also exactly what
     already happens every hour (cron's `run` and this `listen` process are
     already two concurrent processes sharing the DB via WAL mode), so this
-    adds no new concurrency risk."""
+    adds no new concurrency risk. Since scrape/structure/analyze are
+    shared and score/notify loop over every subscriber, one person's
+    `/find` refreshes results for everyone using this bot, not just them."""
     if not update.effective_chat:
         return
     chat_id = update.effective_chat.id
@@ -869,7 +965,7 @@ async def _run_find_pipeline(chat_id: int, bot: Bot) -> None:
         _find_running.discard(chat_id)
 
 
-def _format_search_hit(row: ListingRow) -> str:
+def _format_search_hit(row: ListingRow, scored: ScoredListing | None) -> str:
     stats = []
     if row.price_eur is not None:
         stats.append(f"€{row.price_eur:,}")
@@ -880,41 +976,81 @@ def _format_search_hit(row: ListingRow) -> str:
     header = row.raw_title
     if stats:
         header += " -- " + " · ".join(stats)
-    score_line = f"Score: {row.score:+d}" if row.scored_at is not None else "Not yet scored"
+    score_line = f"Score: {scored.score:+d}" if scored is not None else "Not yet scored for you"
     return f"{header}\n{score_line}\n{row.url}"
 
 
+def _parse_search_args(args: list[str]) -> tuple[str, int | None]:
+    """Splits off a trailing time-range token (see `_SEARCH_RANGE_DAYS`)
+    from the rest of the keyword, e.g. ["golf", "week"] -> ("golf", 7).
+    A range with no keyword (e.g. just `/search today`) is valid too --
+    it means "show me everything new," not "search for the word today"."""
+    if args and args[-1].lower() in _SEARCH_RANGE_DAYS:
+        range_key = args[-1].lower()
+        keyword = " ".join(args[:-1]).strip()
+        return keyword, _SEARCH_RANGE_DAYS[range_key]
+    return " ".join(args).strip(), None
+
+
 async def _cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/search <keyword>` — looks through listings already scraped and
-    structured for a make/model/title match, e.g. `/search golf` or
-    `/search bmw`. Doesn't scrape anything new -- see /find for that."""
-    keyword = " ".join(context.args or []).strip()
-    if not keyword:
-        await _reply(update, "🔍 What are you looking for? Type it after the command, e.g. /search golf")
+    """`/search <keyword>` looks through listings already scraped for a
+    make/model/title match, e.g. `/search golf`. Add a time range to also
+    filter by how recently a listing was found, e.g. `/search golf week`
+    -- or search a range alone, e.g. `/search today`, to see everything
+    new without a keyword. Doesn't scrape anything new -- see /find for
+    that."""
+    chat = update.effective_chat
+    if not chat:
         return
+    keyword, range_days = _parse_search_args(context.args or [])
+    if not keyword and range_days is None:
+        await _reply(
+            update,
+            "🔍 What are you looking for? Type it after the command, e.g. /search golf -- "
+            "or tap a range below to see everything found recently.",
+            reply_markup=_search_range_keyboard(),
+        )
+        return
+
+    _last_search_keyword[chat.id] = keyword
+    since = datetime.now(timezone.utc) - timedelta(days=range_days) if range_days else None
 
     session = get_session()
     try:
-        hits = repo.search_listings(session, keyword)
+        hits = repo.search_listings(session, keyword, since=since)
+        scores_by_id = repo.get_user_scores_by_listing_ids(session, chat.id, [h.listing_id for h in hits])
     finally:
         session.close()
 
+    range_note = f" from the last {range_days} day{'s' if range_days != 1 else ''}" if range_days else ""
+    show_range_buttons = range_days is None
+
     if not hits:
-        await _reply(update, f"🔍 I haven't found any \"{keyword}\" listings yet -- I'll keep looking. Try /find to search right now instead of waiting.")
+        text = f'🔍 No "{keyword}" listings found{range_note}.' if keyword else f"🔍 Nothing found{range_note}."
+        if show_range_buttons:
+            text += " Try /find to search right now instead of waiting, or tap a range below."
+        await _reply(update, text, reply_markup=_search_range_keyboard() if show_range_buttons else None)
         return
 
-    lines = [f"🔍 Found {len(hits)} match{'es' if len(hits) != 1 else ''} for \"{keyword}\":", ""]
-    lines.append("\n\n".join(_format_search_hit(row) for row in hits))
-    await _reply(update, "\n".join(lines))
+    if keyword:
+        header = f'🔍 Found {len(hits)} match{"es" if len(hits) != 1 else ""} for "{keyword}"{range_note}:'
+    else:
+        header = f'🔍 Found {len(hits)} listing{"s" if len(hits) != 1 else ""}{range_note}:'
+    lines = [header, ""]
+    lines.append("\n\n".join(_format_search_hit(row, scores_by_id.get(row.listing_id)) for row in hits))
+    await _reply(update, "\n".join(lines), reply_markup=_search_range_keyboard() if show_range_buttons else None)
 
 
 async def _cmd_reviewfeedback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/reviewfeedback` — runs stage 7's LangGraph review agent over
-    accumulated 👍/👎 feedback and posts the patterns + suggested
-    scoring weight changes it found. Advisory only: nothing changes until
-    you send /validate."""
+    """`/reviewfeedback` — runs stage 7's LangGraph review agent over this
+    subscriber's own accumulated 👍/👎 feedback and posts the patterns +
+    suggested scoring weight changes it found. Advisory only: nothing
+    changes until you send /validate."""
+    chat = update.effective_chat
+    if not chat:
+        return
     await _reply(update, "Reviewing feedback so far, one moment...")
-    result = run_feedback_review()
+    result = run_feedback_review(chat.id)
     if result.get("skipped"):
         await _reply(update, result["skip_reason"])
         return
@@ -922,11 +1058,14 @@ async def _cmd_reviewfeedback(update: Update, _context: ContextTypes.DEFAULT_TYP
 
 
 async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/validate` — applies the *last* `/reviewfeedback` run's suggested
-    scoring weight changes for real. This is the one command that
-    actually changes future scoring behavior; everything else in stage 7
-    is advisory until you send this."""
-    applied = apply_latest_suggestions()
+    """`/validate` — applies this subscriber's *last* `/reviewfeedback`
+    run's suggested scoring weight changes for real. This is the one
+    command that actually changes future scoring behavior for them;
+    everything else in stage 7 is advisory until you send this."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    applied = apply_latest_suggestions(chat.id)
     if applied is None:
         await _reply(update, "Nothing to apply yet — run /reviewfeedback first, then /validate if you agree with what it suggests.")
         return
@@ -950,7 +1089,7 @@ _BOT_COMMANDS = [
     BotCommand("budget", "Set your price range"),
     BotCommand("minyear", "Set the oldest year you'll consider"),
     BotCommand("threshold", "Set how picky I should be"),
-    BotCommand("radius", "Set how far I should search"),
+    BotCommand("radius", "Set how far I should search (shared by everyone)"),
     BotCommand("mileage", "Set the highest mileage you'll accept"),
     BotCommand("make", "Only show certain brands, e.g. bmw, toyota"),
     BotCommand("fuel", "Only show certain fuel types, e.g. diesel"),
@@ -1003,8 +1142,10 @@ def run_feedback_listener() -> None:
     interrupted (Ctrl+C). Run this as a standing background process —
     `becarscout notify` only sends messages, it doesn't listen for
     replies or commands."""
-    token, _ = _get_credentials()
-    application = ApplicationBuilder().token(token).post_init(_post_init).build()
+    application = ApplicationBuilder().token(_get_token()).post_init(_post_init).build()
+    # group=-1 runs before every other handler below, for every update --
+    # this is what actually makes someone a subscriber (see its docstring).
+    application.add_handler(TypeHandler(Update, _ensure_subscribed_middleware), group=-1)
     application.add_handler(
         CallbackQueryHandler(_handle_feedback_callback, pattern=rf"^{CALLBACK_PREFIX}:")
     )

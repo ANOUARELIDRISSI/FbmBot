@@ -3,8 +3,13 @@ runs cheap: each `get_listings_needing_*` function returns only rows that
 haven't reached that stage yet, so a listing scraped last hour and already
 analyzed doesn't get re-sent to Mistral (or re-scraped, re-scored, ...)
 on every subsequent run. Converts between the pipeline's pydantic models
-(unchanged from stages 1-6) and `ListingRow` — the DB is purely a
+(unchanged from stages 1-6) and the DB rows — the DB is purely a
 persistence detail, not a change to the actual pipeline logic.
+
+Multi-user note (added 2026-09-06): scrape/structure/analyze/baseline
+stay shared queries (one row per listing, `ListingRow`). Score/gate/notify
+are per-subscriber (`UserListingScoreRow`, keyed by chat_id + listing_id) --
+see `db/models.py`'s module docstring for the reasoning split.
 """
 
 from __future__ import annotations
@@ -16,12 +21,21 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from becarscout.analyzer.models import DescriptionSignals
+from becarscout.pricing.models import PriceBaseline
 from becarscout.scoring.models import ScoredListing, ScoringWeights
 from becarscout.scraper.models import RawListing
-from becarscout.settings import PipelineSettings
+from becarscout.settings import DEFAULT_RADIUS_KM, PipelineSettings
 from becarscout.structurer.models import StructuredListing
 
-from .models import ListingRow, PipelineSettingsRow, ScoringWeightsRow
+from .models import (
+    GlobalScrapeSettingsRow,
+    ListingRow,
+    PendingSuggestionRow,
+    PipelineSettingsRow,
+    ScoringWeightsRow,
+    SubscriberRow,
+    UserListingScoreRow,
+)
 
 
 def _now() -> datetime:
@@ -56,7 +70,11 @@ def update_changed_listing(session: Session, listing: RawListing) -> None:
     untouched. Analysis (`analyzed_at`) is only reset if the description
     text itself actually changed too — no point re-spending a Mistral
     call on stage 3 when only the price moved and the seller's wording
-    didn't."""
+    didn't. The market baseline (`baseline_computed_at`) is left alone —
+    a price change on this one listing doesn't change what similar cars
+    sell for — but every subscriber's own score of it is invalidated
+    (deleted from `UserListingScoreRow`) since their price-gap component
+    depends on this listing's price specifically."""
     row = session.get(ListingRow, listing.listing_id)
     if row is None:
         return
@@ -67,10 +85,14 @@ def update_changed_listing(session: Session, listing: RawListing) -> None:
     row.photo_urls_json = json.dumps(listing.photo_urls)
     row.listed_relative_text = listing.listed_relative_text
     row.structured_at = None
-    row.scored_at = None
-    row.notified_at = None
     if description_changed:
         row.analyzed_at = None
+
+    for user_score in session.execute(
+        select(UserListingScoreRow).where(UserListingScoreRow.listing_id == listing.listing_id)
+    ).scalars().all():
+        session.delete(user_score)
+
     session.commit()
 
 
@@ -194,13 +216,52 @@ def save_signals(session: Session, signals_list: list[DescriptionSignals]) -> No
     session.commit()
 
 
-def get_listings_needing_scoring(
-    session: Session,
-) -> list[tuple[StructuredListing, DescriptionSignals | None]]:
+def get_listings_needing_baseline(session: Session) -> list[StructuredListing]:
+    """Shared step: every analyzed listing whose market-price baseline
+    hasn't been resolved yet — independent of any subscriber, so the
+    expensive part (Playwright + comps fetch) happens once per listing no
+    matter how many people use the bot."""
     rows = (
         session.execute(
             select(ListingRow).where(
-                ListingRow.analyzed_at.is_not(None), ListingRow.scored_at.is_(None)
+                ListingRow.analyzed_at.is_not(None), ListingRow.baseline_computed_at.is_(None)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_row_to_structured(row) for row in rows]
+
+
+def save_baselines(session: Session, baselines: dict[str, PriceBaseline]) -> None:
+    for listing_id, baseline in baselines.items():
+        row = session.get(ListingRow, listing_id)
+        if row is None:
+            continue
+        row.baseline_median_price_eur = baseline.median_price_eur
+        row.baseline_sample_size = baseline.sample_size
+        row.baseline_confidence = baseline.confidence
+        row.baseline_computed_at = _now()
+    session.commit()
+
+
+def get_listings_needing_scoring(
+    session: Session, chat_id: int
+) -> list[tuple[StructuredListing, DescriptionSignals | None, PriceBaseline]]:
+    """Per-subscriber: every listing with a resolved baseline that this
+    chat_id hasn't scored yet (never scored, or reset by `/rescore`)."""
+    already_scored_ids = {
+        listing_id
+        for (listing_id,) in session.execute(
+            select(UserListingScoreRow.listing_id).where(
+                UserListingScoreRow.chat_id == chat_id, UserListingScoreRow.scored_at.is_not(None)
+            )
+        )
+    }
+    rows = (
+        session.execute(
+            select(ListingRow).where(
+                ListingRow.analyzed_at.is_not(None), ListingRow.baseline_computed_at.is_not(None)
             )
         )
         .scalars()
@@ -208,20 +269,29 @@ def get_listings_needing_scoring(
     )
     result = []
     for row in rows:
+        if row.listing_id in already_scored_ids:
+            continue
         structured = _row_to_structured(row)
         signals = DescriptionSignals.model_validate_json(row.signals_json) if row.signals_json else None
-        result.append((structured, signals))
+        baseline = PriceBaseline(
+            make=row.make or "unknown",
+            model=row.model_hint or "unknown",
+            target_year=row.year,
+            target_mileage_km=row.mileage_km,
+            median_price_eur=row.baseline_median_price_eur,
+            sample_size=row.baseline_sample_size,
+            confidence=row.baseline_confidence,
+        )
+        result.append((structured, signals, baseline))
     return result
 
 
-def save_scores(session: Session, scored_list: list[ScoredListing]) -> None:
+def save_user_scores(session: Session, chat_id: int, scored_list: list[ScoredListing]) -> None:
     for scored in scored_list:
-        row = session.get(ListingRow, scored.listing_id)
+        row = session.get(UserListingScoreRow, (chat_id, scored.listing_id))
         if row is None:
-            continue
-        row.baseline_median_price_eur = scored.baseline_median_price_eur
-        row.baseline_sample_size = scored.baseline_sample_size
-        row.baseline_confidence = scored.baseline_confidence
+            row = UserListingScoreRow(chat_id=chat_id, listing_id=scored.listing_id)
+            session.add(row)
         row.price_component = scored.price_component
         row.condition_component = scored.condition_component
         row.score = scored.score
@@ -232,7 +302,7 @@ def save_scores(session: Session, scored_list: list[ScoredListing]) -> None:
     session.commit()
 
 
-def _row_to_scored(row: ListingRow) -> ScoredListing:
+def _row_to_scored(row: ListingRow, user_row: UserListingScoreRow) -> ScoredListing:
     return ScoredListing(
         listing_id=row.listing_id,
         url=row.url,
@@ -244,111 +314,173 @@ def _row_to_scored(row: ListingRow) -> ScoredListing:
         mileage_km=row.mileage_km,
         fuel_type=row.fuel_type,
         transmission=row.transmission,
-        condition_highlights=json.loads(row.condition_highlights_json) if row.condition_highlights_json else [],
+        condition_highlights=json.loads(user_row.condition_highlights_json) if user_row.condition_highlights_json else [],
         baseline_median_price_eur=row.baseline_median_price_eur,
         baseline_sample_size=row.baseline_sample_size,
         baseline_confidence=row.baseline_confidence,
-        price_component=row.price_component,
-        condition_component=row.condition_component,
-        score=row.score,
-        above_threshold=row.above_threshold,
-        reasoning=json.loads(row.reasoning_json),
+        price_component=user_row.price_component,
+        condition_component=user_row.condition_component,
+        score=user_row.score,
+        above_threshold=user_row.above_threshold,
+        reasoning=json.loads(user_row.reasoning_json) if user_row.reasoning_json else [],
     )
 
 
-def get_scored_listing(session: Session, listing_id: str) -> ScoredListing | None:
-    """Looks up one listing's full scored context by id — used by the
-    feedback agent when a 👍/👎 comes in, since Telegram's callback_data
-    only carries the bare listing_id, not the make/year/price/score that
-    the memory description needs."""
+def get_scored_listing(session: Session, chat_id: int, listing_id: str) -> ScoredListing | None:
+    """Looks up one listing's full scored context for one subscriber —
+    used by the feedback agent when a 👍/👎 comes in (Telegram's
+    callback_data only carries the bare listing_id) and by the "Why?"
+    button. Returns None if either the listing or that chat's score for
+    it doesn't exist."""
     row = session.get(ListingRow, listing_id)
     if row is None:
         return None
-    return _row_to_scored(row)
+    user_row = session.get(UserListingScoreRow, (chat_id, listing_id))
+    if user_row is None:
+        return None
+    return _row_to_scored(row, user_row)
 
 
-def search_listings(session: Session, keyword: str, limit: int = 10) -> list[ListingRow]:
-    """Backs Telegram's `/search` — a plain keyword match against make,
-    model, and the raw scraped title, over listings already structured
-    (so make/model exist to search at all). Ranked by score first (best
-    matches on top for anything already scored), then most recent —
-    unscored listings naturally fall after scored ones since `score`
-    defaults to 0."""
-    pattern = f"%{keyword}%"
-    return (
+def get_user_scores_by_listing_ids(session: Session, chat_id: int, listing_ids: list[str]) -> dict[str, ScoredListing]:
+    """Batch version of `get_scored_listing` for a known set of ids — used
+    by `/search` to show each hit's score for the requesting chat without
+    a query per row."""
+    if not listing_ids:
+        return {}
+    listings_by_id = {
+        row.listing_id: row
+        for row in session.execute(select(ListingRow).where(ListingRow.listing_id.in_(listing_ids))).scalars().all()
+    }
+    user_rows = session.execute(
+        select(UserListingScoreRow).where(
+            UserListingScoreRow.chat_id == chat_id, UserListingScoreRow.listing_id.in_(listing_ids)
+        )
+    ).scalars().all()
+    return {
+        user_row.listing_id: _row_to_scored(listings_by_id[user_row.listing_id], user_row)
+        for user_row in user_rows
+        if user_row.listing_id in listings_by_id
+    }
+
+
+def get_unnotified_opportunities(session: Session, chat_id: int) -> list[ScoredListing]:
+    user_rows = (
         session.execute(
-            select(ListingRow)
-            .where(
-                ListingRow.structured_at.is_not(None),
-                or_(
-                    ListingRow.make.ilike(pattern),
-                    ListingRow.model_hint.ilike(pattern),
-                    ListingRow.raw_title.ilike(pattern),
-                ),
+            select(UserListingScoreRow).where(
+                UserListingScoreRow.chat_id == chat_id,
+                UserListingScoreRow.above_threshold.is_(True),
+                UserListingScoreRow.notified_at.is_(None),
             )
-            .order_by(ListingRow.score.desc(), ListingRow.scraped_at.desc())
-            .limit(limit)
         )
         .scalars()
         .all()
     )
+    result = []
+    for user_row in user_rows:
+        listing_row = session.get(ListingRow, user_row.listing_id)
+        if listing_row is not None:
+            result.append(_row_to_scored(listing_row, user_row))
+    return result
 
 
-def get_unnotified_opportunities(session: Session) -> list[ScoredListing]:
-    rows = (
-        session.execute(
-            select(ListingRow).where(
-                ListingRow.above_threshold.is_(True), ListingRow.notified_at.is_(None)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return [_row_to_scored(row) for row in rows]
-
-
-def mark_notified(session: Session, listing_ids: list[str]) -> None:
+def mark_notified(session: Session, chat_id: int, listing_ids: list[str]) -> None:
     for listing_id in listing_ids:
-        row = session.get(ListingRow, listing_id)
+        row = session.get(UserListingScoreRow, (chat_id, listing_id))
         if row is not None:
             row.notified_at = _now()
     session.commit()
 
 
-def reset_scoring_for_rescore(session: Session) -> int:
-    """Nulls `scored_at` for every analyzed listing so `becarscout score`
-    picks all of them up again with whatever the *current* code computes
-    — incremental processing (`WHERE scored_at IS NULL`) means a fix to
-    scoring.py/baseline.py/analyzer's schema otherwise only ever affects
-    listings scored *after* the fix; anything already scored keeps its
-    old, possibly now-known-wrong value forever (see Project.md's
-    Infrastructure notes — found live via the 1986 Ford F-150 case, which
-    kept its pre-fix +72 score for days). Leaves `notified_at` untouched
-    on purpose — re-scoring shouldn't by itself cause a re-notification
-    for something already sent; `becarscout score` + `becarscout notify`
-    will only notify what's newly `above_threshold` and still unset."""
-    result = session.execute(
-        select(ListingRow.listing_id).where(ListingRow.analyzed_at.is_not(None))
-    ).scalars().all()
-    for listing_id in result:
-        row = session.get(ListingRow, listing_id)
-        if row is not None:
-            row.scored_at = None
+def reset_scoring_for_rescore(session: Session, chat_id: int | None = None) -> int:
+    """Nulls `scored_at` on `UserListingScoreRow` so `becarscout score`
+    picks those listings up again with whatever the *current* code
+    computes — incremental processing otherwise means a fix to
+    scoring.py/baseline.py/analyzer's schema only ever affects listings
+    scored *after* the fix (see Project.md's Infrastructure notes — found
+    live via the 1986 Ford F-150 case). `notified_at` is left untouched on
+    purpose, so this won't cause a re-notification for something already
+    sent. `chat_id=None` (the CLI default) resets every subscriber."""
+    query = select(UserListingScoreRow)
+    if chat_id is not None:
+        query = query.where(UserListingScoreRow.chat_id == chat_id)
+    rows = session.execute(query).scalars().all()
+    for row in rows:
+        row.scored_at = None
     session.commit()
-    return len(result)
+    return len(rows)
 
 
-def get_pipeline_settings(session: Session) -> PipelineSettings:
-    """Current scrape/gate parameters — `becarscout run` (and every
-    individual stage command) reads this at the start of a run and uses
-    it as the default for any parameter not explicitly overridden by a
-    CLI flag. No row yet (nothing has ever been changed via Telegram)
-    just means the hardcoded defaults in `settings.py`."""
-    row = session.get(PipelineSettingsRow, 1)
+def search_listings(
+    session: Session, keyword: str, limit: int = 10, since: datetime | None = None
+) -> list[ListingRow]:
+    """Backs Telegram's `/search` — a plain keyword match against make,
+    model, and the raw scraped title, over listings already structured
+    (so make/model exist to search at all), optionally restricted to
+    listings first seen since a given time (the "today"/"3 days"/"week"
+    quick-pick ranges). An empty keyword matches everything, so `/search`
+    with only a time range (no keyword) works as "show me what's new"."""
+    conditions = [ListingRow.structured_at.is_not(None)]
+    if keyword:
+        pattern = f"%{keyword}%"
+        conditions.append(
+            or_(
+                ListingRow.make.ilike(pattern),
+                ListingRow.model_hint.ilike(pattern),
+                ListingRow.raw_title.ilike(pattern),
+            )
+        )
+    if since is not None:
+        conditions.append(ListingRow.scraped_at >= since)
+    return (
+        session.execute(
+            select(ListingRow).where(*conditions).order_by(ListingRow.scraped_at.desc()).limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def get_subscribers(session: Session) -> list[int]:
+    return [chat_id for (chat_id,) in session.execute(select(SubscriberRow.chat_id))]
+
+
+def ensure_subscriber(session: Session, chat_id: int) -> None:
+    """Registers a chat as a subscriber the first time it's seen — called
+    from a `group=-1` "middleware" handler in `notifier/bot.py` on every
+    update, so subscribing doesn't depend on remembering to send /start
+    specifically. A no-op for an already-known chat_id."""
+    if session.get(SubscriberRow, chat_id) is None:
+        session.add(SubscriberRow(chat_id=chat_id, created_at=_now()))
+        session.commit()
+
+
+def get_global_scrape_radius_km(session: Session) -> int:
+    row = session.get(GlobalScrapeSettingsRow, 1)
+    return row.radius_km if row is not None else DEFAULT_RADIUS_KM
+
+
+def update_global_scrape_radius_km(session: Session, radius_km: int) -> int:
+    row = session.get(GlobalScrapeSettingsRow, 1)
+    if row is None:
+        row = GlobalScrapeSettingsRow(id=1, radius_km=radius_km)
+        session.add(row)
+    else:
+        row.radius_km = radius_km
+    row.updated_at = _now()
+    session.commit()
+    return row.radius_km
+
+
+def get_pipeline_settings(session: Session, chat_id: int) -> PipelineSettings:
+    """This subscriber's current gate parameters — `becarscout run`
+    reads this per subscriber at score time and uses it as the default
+    for any parameter not explicitly overridden by a CLI flag. No row yet
+    (nothing has ever been changed via Telegram) just means the hardcoded
+    defaults in `settings.py`."""
+    row = session.execute(select(PipelineSettingsRow).where(PipelineSettingsRow.chat_id == chat_id)).scalar_one_or_none()
     if row is None:
         return PipelineSettings()
     return PipelineSettings(
-        radius_km=row.radius_km,
         min_price=row.min_price,
         max_price=row.max_price,
         min_year=row.min_year,
@@ -360,20 +492,19 @@ def get_pipeline_settings(session: Session) -> PipelineSettings:
     )
 
 
-def update_pipeline_settings(session: Session, **changes: object) -> PipelineSettings:
-    """Partial update — only the given fields change; anything not
-    passed keeps its current stored value (or the hardcoded default, on
-    the very first change ever made). Backs `/budget`, `/minyear`,
-    `/threshold`, `/radius`. `min_year=None` is a valid, meaningful
-    change (disables the year cutoff entirely — see `scoring/gate.py`),
-    not "leave unset"; only keys actually present in `changes` are
-    touched."""
-    row = session.get(PipelineSettingsRow, 1)
+def update_pipeline_settings(session: Session, chat_id: int, **changes: object) -> PipelineSettings:
+    """Partial update for one subscriber — only the given fields change;
+    anything not passed keeps its current stored value (or the hardcoded
+    default, on the very first change ever made for this chat_id).
+    `min_year=None` is a valid, meaningful change (disables the year
+    cutoff entirely — see `scoring/gate.py`), not "leave unset"; only keys
+    actually present in `changes` are touched. `radius_km` is not a valid
+    key here anymore — see `update_global_scrape_radius_km`."""
+    row = session.execute(select(PipelineSettingsRow).where(PipelineSettingsRow.chat_id == chat_id)).scalar_one_or_none()
     if row is None:
         current = PipelineSettings()
         row = PipelineSettingsRow(
-            id=1,
-            radius_km=current.radius_km,
+            chat_id=chat_id,
             min_price=current.min_price,
             max_price=current.max_price,
             min_year=current.min_year,
@@ -388,30 +519,59 @@ def update_pipeline_settings(session: Session, **changes: object) -> PipelineSet
         setattr(row, key, value)
     row.updated_at = _now()
     session.commit()
-    return get_pipeline_settings(session)
+    return get_pipeline_settings(session, chat_id)
 
 
-def get_scoring_weights(session: Session) -> ScoringWeights:
-    """Current condition-signal point weights. No row yet means nothing
-    has ever been changed via `/validate` — the hardcoded original
-    values from `scoring/models.py`'s `ScoringWeights` defaults."""
-    row = session.get(ScoringWeightsRow, 1)
+def get_scoring_weights(session: Session, chat_id: int) -> ScoringWeights:
+    """This subscriber's current condition-signal point weights. No row
+    yet means nothing has ever been changed via `/validate` for this
+    chat_id — the hardcoded original values from `scoring/models.py`'s
+    `ScoringWeights` defaults."""
+    row = session.execute(select(ScoringWeightsRow).where(ScoringWeightsRow.chat_id == chat_id)).scalar_one_or_none()
     if row is None:
         return ScoringWeights()
     return ScoringWeights(**{name: getattr(row, name) for name in ScoringWeights.model_fields})
 
 
-def update_scoring_weights(session: Session, **changes: int) -> ScoringWeights:
+def update_scoring_weights(session: Session, chat_id: int, **changes: int) -> ScoringWeights:
     """Partial update, same pattern as `update_pipeline_settings` —
-    backs `/validate` applying an approved feedback suggestion. Only the
-    named weights change; everything else keeps its current value."""
-    row = session.get(ScoringWeightsRow, 1)
+    backs this subscriber's `/validate` applying their own approved
+    feedback suggestion. Only the named weights change; everything else
+    keeps its current value."""
+    row = session.execute(select(ScoringWeightsRow).where(ScoringWeightsRow.chat_id == chat_id)).scalar_one_or_none()
     if row is None:
         current = ScoringWeights()
-        row = ScoringWeightsRow(id=1, **current.model_dump())
+        row = ScoringWeightsRow(chat_id=chat_id, **current.model_dump())
         session.add(row)
     for key, value in changes.items():
         setattr(row, key, value)
     row.updated_at = _now()
     session.commit()
-    return get_scoring_weights(session)
+    return get_scoring_weights(session, chat_id)
+
+
+def get_pending_suggestions(session: Session, chat_id: int) -> list[dict] | None:
+    """This subscriber's last `/reviewfeedback` suggestions, waiting on a
+    `/validate` — None if there's nothing pending (never reviewed, or
+    already applied/cleared)."""
+    row = session.get(PendingSuggestionRow, chat_id)
+    if row is None:
+        return None
+    return json.loads(row.suggestions_json)
+
+
+def save_pending_suggestions(session: Session, chat_id: int, suggestions: list[dict]) -> None:
+    row = session.get(PendingSuggestionRow, chat_id)
+    if row is None:
+        row = PendingSuggestionRow(chat_id=chat_id, suggestions_json="[]", created_at=_now())
+        session.add(row)
+    row.suggestions_json = json.dumps(suggestions)
+    row.created_at = _now()
+    session.commit()
+
+
+def clear_pending_suggestions(session: Session, chat_id: int) -> None:
+    row = session.get(PendingSuggestionRow, chat_id)
+    if row is not None:
+        session.delete(row)
+        session.commit()

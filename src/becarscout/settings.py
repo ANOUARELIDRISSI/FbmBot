@@ -1,20 +1,29 @@
-"""User-adjustable pipeline parameters — search radius, price range, the
-year/score gates. Its own module (rather than living inside `cli.py` or
-`scoring/`) since it's shared by the CLI (`becarscout run` reads this as
-its defaults) and the Telegram bot (`/budget`, `/minyear`, `/threshold`,
-`/radius`, `/settings` change it live, without a redeploy). Persisted in
-`db/models.py`'s `PipelineSettingsRow` singleton — this pydantic model is
-what callers actually pass around; see `db/repository.py`'s
-`get_pipeline_settings`/`update_pipeline_settings`.
+"""User-adjustable pipeline parameters. Split in two, as of multi-user
+support (2026-09-06):
+
+- `DEFAULT_RADIUS_KM` / `db/models.py`'s `GlobalScrapeSettingsRow` — the
+  *one* shared search radius, since there's no per-listing distance figure
+  to filter by after the fact; every subscriber's search uses the same
+  radius. Changed via `/radius`.
+- `PipelineSettings` below — everything else (budget, year, threshold,
+  mileage, brand, fuel, transmission), one full set *per subscriber*,
+  persisted in `db/models.py`'s `PipelineSettingsRow` (keyed by chat_id).
+  Changed via `/budget`, `/minyear`, `/threshold`, `/mileage`, `/make`,
+  `/fuel`, `/transmission`, `/settings`.
+
+Its own module (rather than living inside `cli.py` or `scoring/`) since
+it's shared by the CLI (`becarscout run` reads this as its defaults) and
+the Telegram bot.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
+DEFAULT_RADIUS_KM = 100
+
 
 class PipelineSettings(BaseModel):
-    radius_km: int = 100
     min_price: int | None = None
     max_price: int | None = None
     min_year: int | None = 2010

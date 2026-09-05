@@ -10,20 +10,25 @@ from .db import get_session
 from .db import repository as repo
 from .feedback_agent import run_feedback_review
 from .notifier import find_chat_ids, run_feedback_listener, send_new_opportunities
-from .scoring import DEFAULT_MIN_YEAR, DEFAULT_THRESHOLD, apply_decision_gate, score_listings
+from .scoring import apply_decision_gate, resolve_baselines, score_listing
 from .scraper import launch_login_browser, scrape_belgium_cars
-from .settings import PipelineSettings
 from .structurer import structure_listings
 
 logger = logging.getLogger(__name__)
 
 
 # ---- core stage functions (reusable by both individual commands and `run`) ----
+#
+# Multi-user note (2026-09-06): scrape/structure/analyze/resolve-baselines
+# stay shared, one pass regardless of how many people use the bot. score
+# and notify loop over every subscriber internally, using each one's own
+# settings/weights -- see db/models.py's module docstring for why the
+# split lands where it does.
 
 
 async def do_scrape(
     *,
-    radius_km: int = 100,
+    radius_km: int | None = None,
     min_price: int | None = None,
     max_price: int | None = None,
     max_scrolls: int = 8,
@@ -35,11 +40,12 @@ async def do_scrape(
     try:
         known_ids = frozenset(repo.get_all_listing_ids(session))
         known_price_texts = repo.get_known_price_texts(session)
+        resolved_radius = radius_km if radius_km is not None else repo.get_global_scrape_radius_km(session)
     finally:
         session.close()
 
     new_listings, price_changed_listings = await scrape_belgium_cars(
-        radius_km=radius_km,
+        radius_km=resolved_radius,
         min_price=min_price,
         max_price=max_price,
         max_scrolls=max_scrolls,
@@ -91,75 +97,97 @@ def do_analyze(*, model: str = DEFAULT_MODEL, delay: float = 1.0) -> tuple[int, 
         session.close()
 
 
-async def do_score(
-    *,
-    threshold: int = DEFAULT_THRESHOLD,
-    min_year: int | None = DEFAULT_MIN_YEAR,
-    max_mileage_km: int | None = None,
-    makes: str | None = None,
-    fuel_types: str | None = None,
-    transmission: str | None = None,
-) -> tuple[int, int]:
+async def do_resolve_baselines() -> int:
+    """Shared step: resolves the market-price baseline for every analyzed
+    listing that doesn't have one yet — once per listing, regardless of
+    subscriber count (see module docstring)."""
     session = get_session()
     try:
-        pending = repo.get_listings_needing_scoring(session)
+        pending = repo.get_listings_needing_baseline(session)
         if not pending:
-            return 0, 0
-        structured_listings = [s for s, _ in pending]
-        signals_by_id = {s.listing_id: sig for s, sig in pending if sig is not None}
-        weights = repo.get_scoring_weights(session)
-        scored = await score_listings(structured_listings, signals_by_id, weights)
-        scored = apply_decision_gate(
-            scored,
-            threshold=threshold,
-            min_year=min_year,
-            max_mileage_km=max_mileage_km,
-            makes=makes,
-            fuel_types=fuel_types,
-            transmission=transmission,
-        )
-        repo.save_scores(session, scored)
-        opportunities = sum(1 for s in scored if s.above_threshold)
-        return len(scored), opportunities
+            return 0
+    finally:
+        session.close()
+
+    baselines = await resolve_baselines(pending)
+
+    session = get_session()
+    try:
+        repo.save_baselines(session, baselines)
+        return len(baselines)
+    finally:
+        session.close()
+
+
+async def do_score() -> tuple[int, int]:
+    """Per-subscriber: scores every listing with a resolved baseline that
+    hasn't been scored for that subscriber yet, using their own weights
+    and gate settings. Pure computation, no network — cheap even with
+    several subscribers, unlike `do_resolve_baselines`."""
+    session = get_session()
+    try:
+        subscribers = repo.get_subscribers(session)
+        total_scored = 0
+        total_opportunities = 0
+        for chat_id in subscribers:
+            pending = repo.get_listings_needing_scoring(session, chat_id)
+            if not pending:
+                continue
+            weights = repo.get_scoring_weights(session, chat_id)
+            settings = repo.get_pipeline_settings(session, chat_id)
+            scored = [score_listing(structured, signals, baseline, weights) for structured, signals, baseline in pending]
+            scored = apply_decision_gate(
+                scored,
+                threshold=settings.threshold,
+                min_year=settings.min_year,
+                max_mileage_km=settings.max_mileage_km,
+                makes=settings.makes,
+                fuel_types=settings.fuel_types,
+                transmission=settings.transmission,
+            )
+            repo.save_user_scores(session, chat_id, scored)
+            total_scored += len(scored)
+            total_opportunities += sum(1 for s in scored if s.above_threshold)
+        return total_scored, total_opportunities
     finally:
         session.close()
 
 
 async def do_notify() -> int:
+    """Per-subscriber: sends each subscriber only their own unnotified
+    above-threshold opportunities."""
     session = get_session()
     try:
-        opportunities = repo.get_unnotified_opportunities(session)
-        if not opportunities:
-            return 0
-        opportunities.sort(key=lambda s: s.score, reverse=True)
-        sent_ids = await send_new_opportunities(opportunities)
-        repo.mark_notified(session, sent_ids)
-        return len(sent_ids)
+        subscribers = repo.get_subscribers(session)
+        total_sent = 0
+        for chat_id in subscribers:
+            opportunities = repo.get_unnotified_opportunities(session, chat_id)
+            if not opportunities:
+                continue
+            opportunities.sort(key=lambda s: s.score, reverse=True)
+            sent_ids = await send_new_opportunities(chat_id, opportunities)
+            repo.mark_notified(session, chat_id, sent_ids)
+            total_sent += len(sent_ids)
+        return total_sent
     finally:
         session.close()
 
 
 async def run_full_pipeline(
     *,
-    radius_km: int = 100,
+    radius_km: int | None = None,
     min_price: int | None = None,
     max_price: int | None = None,
     max_scrolls: int = 8,
     model: str = DEFAULT_MODEL,
     delay: float = 1.0,
-    threshold: int = DEFAULT_THRESHOLD,
-    min_year: int | None = DEFAULT_MIN_YEAR,
-    max_mileage_km: int | None = None,
-    makes: str | None = None,
-    fuel_types: str | None = None,
-    transmission: str | None = None,
     headless: bool = True,
 ) -> None:
     """Runs every stage in sequence — used by `becarscout run` (and cron).
     Each stage is independently guarded: a failure in one (e.g. Facebook
     changed their markup) still lets already-processed backlog move
     through the remaining stages instead of the whole hourly run being a
-    no-op."""
+    no-op. `score`/`notify` loop over every subscriber internally."""
     try:
         new_count, price_changed_count = await do_scrape(
             radius_km=radius_km, min_price=min_price, max_price=max_price,
@@ -182,10 +210,13 @@ async def run_full_pipeline(
         logger.exception("analyze stage failed")
 
     try:
-        scored_count, opportunity_count = await do_score(
-            threshold=threshold, min_year=min_year, max_mileage_km=max_mileage_km,
-            makes=makes, fuel_types=fuel_types, transmission=transmission,
-        )
+        baseline_count = await do_resolve_baselines()
+        logger.info("baseline: %d listings", baseline_count)
+    except Exception:
+        logger.exception("baseline stage failed")
+
+    try:
+        scored_count, opportunity_count = await do_score()
         logger.info("score: %d listings (%d opportunities)", scored_count, opportunity_count)
     except Exception:
         logger.exception("score stage failed")
@@ -200,30 +231,16 @@ async def run_full_pipeline(
 # ---- CLI glue ----
 
 
-def _current_settings() -> PipelineSettings:
-    """What `becarscout run`/`scrape`/`score` fall back to for any
-    parameter not explicitly given on the command line — this is what
-    lets `/budget`, `/minyear`, `/threshold`, `/radius` (Telegram) change
-    the *next* hourly cron run's behavior without a redeploy, since cron
-    always invokes `becarscout run` with zero flags."""
-    session = get_session()
-    try:
-        return repo.get_pipeline_settings(session)
-    finally:
-        session.close()
-
-
 def _cmd_login(_args: argparse.Namespace) -> None:
     asyncio.run(launch_login_browser())
 
 
 def _cmd_scrape(args: argparse.Namespace) -> None:
-    settings = _current_settings()
     new_count, price_changed_count = asyncio.run(
         do_scrape(
-            radius_km=args.radius_km if args.radius_km is not None else settings.radius_km,
-            min_price=args.min_price if args.min_price is not None else settings.min_price,
-            max_price=args.max_price if args.max_price is not None else settings.max_price,
+            radius_km=args.radius_km,
+            min_price=args.min_price,
+            max_price=args.max_price,
             max_scrolls=args.max_scrolls,
             fetch_details=not args.no_details,
             headless=not args.headed,
@@ -242,22 +259,14 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
     print(f"Analyzed {count} listings ({failed} failed)")
 
 
-def _cmd_score(args: argparse.Namespace) -> None:
-    settings = _current_settings()
-    min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
-    threshold = args.threshold if args.threshold is not None else settings.threshold
-    max_mileage_km = args.max_mileage_km if args.max_mileage_km is not None else settings.max_mileage_km
-    makes = args.makes if args.makes is not None else settings.makes
-    fuel_types = args.fuel_types if args.fuel_types is not None else settings.fuel_types
-    transmission = args.transmission if args.transmission is not None else settings.transmission
-    count, opportunities = asyncio.run(
-        do_score(
-            threshold=threshold, min_year=min_year, max_mileage_km=max_mileage_km,
-            makes=makes, fuel_types=fuel_types, transmission=transmission,
-        )
-    )
-    year_note = f", newer than {min_year}" if min_year is not None else ""
-    print(f"Scored {count} listings ({opportunities} above threshold {threshold}{year_note})")
+def _cmd_baseline(_args: argparse.Namespace) -> None:
+    count = asyncio.run(do_resolve_baselines())
+    print(f"Resolved a market-price baseline for {count} listings")
+
+
+def _cmd_score(_args: argparse.Namespace) -> None:
+    count, opportunities = asyncio.run(do_score())
+    print(f"Scored {count} listing(s) across all subscribers ({opportunities} cleared someone's gate)")
 
 
 def _cmd_notify(_args: argparse.Namespace) -> None:
@@ -265,13 +274,14 @@ def _cmd_notify(_args: argparse.Namespace) -> None:
     print(f"Sent {sent} new opportunit{'y' if sent == 1 else 'ies'}")
 
 
-def _cmd_rescore(_args: argparse.Namespace) -> None:
+def _cmd_rescore(args: argparse.Namespace) -> None:
     session = get_session()
     try:
-        count = repo.reset_scoring_for_rescore(session)
+        count = repo.reset_scoring_for_rescore(session, chat_id=args.chat_id)
     finally:
         session.close()
-    print(f"{count} listings queued for re-scoring — run `becarscout score` (then `notify`) to apply it")
+    who = f"subscriber {args.chat_id}" if args.chat_id is not None else "every subscriber"
+    print(f"{count} listing-score(s) queued for re-scoring ({who}) — run `becarscout score` (then `notify`) to apply it")
 
 
 def _cmd_listen(_args: argparse.Namespace) -> None:
@@ -291,8 +301,8 @@ def _print_safe(text: str) -> None:
         sys.stdout.buffer.write(b"\n")
 
 
-def _cmd_feedback_review(_args: argparse.Namespace) -> None:
-    result = run_feedback_review()
+def _cmd_feedback_review(args: argparse.Namespace) -> None:
+    result = run_feedback_review(args.chat_id)
     if result.get("skipped"):
         _print_safe(result["skip_reason"])
         return
@@ -306,33 +316,20 @@ def _cmd_whoami(_args: argparse.Namespace) -> None:
     if not chats:
         print("No messages found yet — send your bot a message on Telegram first, then run this again.")
         return
-    print("Chat IDs found (use the right one as TELEGRAM_CHAT_ID in .env):")
+    print("Chat IDs found (use one as --chat-id, or just message the bot to subscribe):")
     for chat_id, label in chats:
         print(f"  {chat_id}  ({label})")
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
-    # cron invokes this with zero flags every time, so this is the one
-    # place where the Telegram-set settings (/budget, /minyear,
-    # /threshold, /radius, /mileage, /make, /fuel, /transmission) actually
-    # take effect hour to hour — an explicit CLI flag still wins if one is
-    # given.
-    settings = _current_settings()
-    min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
     asyncio.run(
         run_full_pipeline(
-            radius_km=args.radius_km if args.radius_km is not None else settings.radius_km,
-            min_price=args.min_price if args.min_price is not None else settings.min_price,
-            max_price=args.max_price if args.max_price is not None else settings.max_price,
+            radius_km=args.radius_km,
+            min_price=args.min_price,
+            max_price=args.max_price,
             max_scrolls=args.max_scrolls,
             model=args.model,
             delay=args.delay,
-            threshold=args.threshold if args.threshold is not None else settings.threshold,
-            min_year=min_year,
-            max_mileage_km=args.max_mileage_km if args.max_mileage_km is not None else settings.max_mileage_km,
-            makes=args.makes if args.makes is not None else settings.makes,
-            fuel_types=args.fuel_types if args.fuel_types is not None else settings.fuel_types,
-            transmission=args.transmission if args.transmission is not None else settings.transmission,
             headless=not args.headed,
         )
     )
@@ -353,9 +350,9 @@ def main() -> None:
     login_parser.set_defaults(func=_cmd_login)
 
     scrape_parser = subparsers.add_parser("scrape", help="Scrape car listings across Belgium into the database")
-    scrape_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting (100 if never changed)")
-    scrape_parser.add_argument("--min-price", type=int, default=None, help="Default: current /budget setting")
-    scrape_parser.add_argument("--max-price", type=int, default=None, help="Default: current /budget setting")
+    scrape_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting (shared by every subscriber)")
+    scrape_parser.add_argument("--min-price", type=int, default=None, help="Narrows the live scrape itself (admin-only knob; subscriber /budget is a separate post-scrape filter)")
+    scrape_parser.add_argument("--max-price", type=int, default=None)
     scrape_parser.add_argument("--max-scrolls", type=int, default=8)
     scrape_parser.add_argument(
         "--no-details", action="store_true",
@@ -379,27 +376,26 @@ def main() -> None:
     analyze_parser.add_argument("--delay", type=float, default=1.0, help="Seconds to wait between API calls (default 1.0)")
     analyze_parser.set_defaults(func=_cmd_analyze)
 
-    score_parser = subparsers.add_parser(
-        "score", help="Score newly-analyzed listings (stages 4-5)"
+    baseline_parser = subparsers.add_parser(
+        "baseline", help="Resolve the shared market-price baseline for newly-analyzed listings (stage 4, shared half)"
     )
-    score_parser.add_argument("--threshold", type=int, default=None, help=f"Default: current /threshold setting ({DEFAULT_THRESHOLD} if never changed)")
-    score_parser.add_argument("--min-year", type=int, default=None, help=f"Default: current /minyear setting ({DEFAULT_MIN_YEAR} if never changed)")
-    score_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
-    score_parser.add_argument("--max-mileage-km", type=int, default=None, help="Default: current /mileage setting (no limit if never changed)")
-    score_parser.add_argument("--makes", default=None, help="Comma-separated, e.g. bmw,toyota. Default: current /make setting")
-    score_parser.add_argument("--fuel-types", default=None, help="Comma-separated, e.g. diesel,hybrid. Default: current /fuel setting")
-    score_parser.add_argument("--transmission", default=None, help="automatic or manual. Default: current /transmission setting")
+    baseline_parser.set_defaults(func=_cmd_baseline)
+
+    score_parser = subparsers.add_parser(
+        "score", help="Score newly-baselined listings for every subscriber, using each one's own weights and gate settings"
+    )
     score_parser.set_defaults(func=_cmd_score)
 
     notify_parser = subparsers.add_parser(
-        "notify", help="Send newly-scored above-threshold opportunities to Telegram (stage 6)"
+        "notify", help="Send each subscriber their own newly-scored above-threshold opportunities (stage 6)"
     )
     notify_parser.set_defaults(func=_cmd_notify)
 
     rescore_parser = subparsers.add_parser(
         "rescore",
-        help="Queue every already-scored listing for re-scoring with current code (run after a scoring/baseline fix ships)",
+        help="Queue scored listings for re-scoring with current code (run after a scoring/baseline fix ships)",
     )
+    rescore_parser.add_argument("--chat-id", type=int, default=None, help="Only this subscriber; default: every subscriber")
     rescore_parser.set_defaults(func=_cmd_rescore)
 
     listen_parser = subparsers.add_parser(
@@ -409,31 +405,25 @@ def main() -> None:
 
     feedback_review_parser = subparsers.add_parser(
         "feedback-review",
-        help="Stage 7: review accumulated thumbs up/down feedback for patterns and suggested scoring.py tweaks (advisory only, run manually)",
+        help="Stage 7: review one subscriber's accumulated thumbs up/down feedback for patterns and suggested weight changes (advisory only)",
     )
+    feedback_review_parser.add_argument("--chat-id", type=int, required=True, help="Whose feedback to review (see `whoami`)")
     feedback_review_parser.set_defaults(func=_cmd_feedback_review)
 
     whoami_parser = subparsers.add_parser(
-        "whoami", help="Find your Telegram chat_id (after sending the bot a message) to put in .env"
+        "whoami", help="Find a Telegram chat_id (after that chat has messaged the bot)"
     )
     whoami_parser.set_defaults(func=_cmd_whoami)
 
     run_parser = subparsers.add_parser(
-        "run", help="Run the full pipeline once: scrape, structure, analyze, score, notify — meant for cron"
+        "run", help="Run the full pipeline once: scrape, structure, analyze, baseline, score, notify — meant for cron"
     )
-    run_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting")
-    run_parser.add_argument("--min-price", type=int, default=None, help="Default: current /budget setting")
-    run_parser.add_argument("--max-price", type=int, default=None, help="Default: current /budget setting")
+    run_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting (shared by every subscriber)")
+    run_parser.add_argument("--min-price", type=int, default=None, help="Narrows the live scrape itself (admin-only knob)")
+    run_parser.add_argument("--max-price", type=int, default=None)
     run_parser.add_argument("--max-scrolls", type=int, default=8)
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--delay", type=float, default=1.0)
-    run_parser.add_argument("--threshold", type=int, default=None, help="Default: current /threshold setting")
-    run_parser.add_argument("--min-year", type=int, default=None, help="Default: current /minyear setting")
-    run_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
-    run_parser.add_argument("--max-mileage-km", type=int, default=None, help="Default: current /mileage setting")
-    run_parser.add_argument("--makes", default=None, help="Comma-separated, e.g. bmw,toyota. Default: current /make setting")
-    run_parser.add_argument("--fuel-types", default=None, help="Comma-separated, e.g. diesel,hybrid. Default: current /fuel setting")
-    run_parser.add_argument("--transmission", default=None, help="automatic or manual. Default: current /transmission setting")
     run_parser.add_argument("--headed", action="store_true")
     run_parser.set_defaults(func=_cmd_run)
 

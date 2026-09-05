@@ -1,6 +1,11 @@
-"""Ties stages 2-4 together: for each structured listing, resolves a price
-baseline (fetching/caching 2dehands.be comps only when a make was
-detected) and joins it with that listing's stage-3 signals, if any.
+"""Ties stages 2-4 together. `resolve_baselines` is the shared half: for
+each structured listing, resolves a price baseline (fetching/caching
+2dehands.be comps only when a make was detected) — this is the same for
+every subscriber, so it runs exactly once per listing regardless of how
+many people use the bot (see `db/models.py`'s multi-user note). Scoring
+against a subscriber's own weights (`scoring.score_listing`) is cheap and
+pure, so it's called once per (listing, subscriber) pair directly from
+`cli.py`'s `do_score`, no Playwright/network involved.
 """
 
 from __future__ import annotations
@@ -9,14 +14,10 @@ import logging
 
 from playwright.async_api import Browser, async_playwright
 
-from becarscout.analyzer.models import DescriptionSignals
 from becarscout.pricing.baseline import compute_baseline
 from becarscout.pricing.comps_2dehands import get_comps_cached
 from becarscout.pricing.models import PriceBaseline
 from becarscout.structurer.models import StructuredListing
-
-from .models import DEFAULT_WEIGHTS, ScoredListing, ScoringWeights
-from .scoring import score_listing
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ def _model_query_token(model_hint: str | None) -> str | None:
     return tokens[0] if tokens else None
 
 
-async def _resolve_baseline(listing: StructuredListing, browser: Browser) -> PriceBaseline:
+async def _resolve_one_baseline(listing: StructuredListing, browser: Browser) -> PriceBaseline:
     model_query = _model_query_token(listing.model_hint)
     if not listing.make or not model_query:
         return PriceBaseline(make=listing.make or "unknown", model=model_query or "unknown")
@@ -51,19 +52,15 @@ async def _resolve_baseline(listing: StructuredListing, browser: Browser) -> Pri
     )
 
 
-async def score_listings(
-    structured_listings: list[StructuredListing],
-    signals_by_id: dict[str, DescriptionSignals],
-    weights: ScoringWeights = DEFAULT_WEIGHTS,
-) -> list[ScoredListing]:
-    scored = []
+async def resolve_baselines(structured_listings: list[StructuredListing]) -> dict[str, PriceBaseline]:
+    """listing_id -> its market-price baseline, for every listing given.
+    Shared across all subscribers — see the module docstring."""
+    baselines: dict[str, PriceBaseline] = {}
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         try:
             for listing in structured_listings:
-                baseline = await _resolve_baseline(listing, browser)
-                signals = signals_by_id.get(listing.listing_id)
-                scored.append(score_listing(listing, signals, baseline, weights))
+                baselines[listing.listing_id] = await _resolve_one_baseline(listing, browser)
         finally:
             await browser.close()
-    return scored
+    return baselines

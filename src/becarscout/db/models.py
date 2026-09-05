@@ -3,13 +3,28 @@ the pipeline stages. A single wide table (rather than one table per
 stage) keeps "what still needs processing" a plain `WHERE ... IS NULL`
 query — reasonable at personal-project scale (hundreds to low thousands
 of rows), and avoids join complexity for no real benefit here.
+
+Multi-user note (added 2026-09-06): scraping/structuring/analyzing stay
+shared across everyone — one Facebook scrape, one LLM pass, reused by
+every subscriber. So does the market-price *baseline* (comps are the same
+regardless of who's asking) — hence `baseline_*` and `baseline_computed_at`
+staying here. What genuinely differs per person is the *weights* applied
+to condition signals and the *gate* (threshold/year/mileage/brand/fuel/
+transmission) — that's why `price_component`/`condition_component`/
+`score`/`above_threshold`/`reasoning_json`/`condition_highlights_json`/
+`scored_at`/`notified_at` moved to `UserListingScoreRow` below, keyed by
+(chat_id, listing_id). The old columns of those names are left in place
+on this table (SQLite makes dropping columns painful, and it's harmless)
+but nothing reads or writes them anymore — same tolerance this project
+already has for the stray leftover `feedback_verdict` column from an
+earlier branch (see Project.md's SQLite-corruption incident notes).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -53,40 +68,99 @@ class ListingRow(Base):
     signals_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     analyzed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    # Stage 4/5: scoring + decision gate
+    # Stage 4 (shared half): the market-price baseline is the same for
+    # every subscriber, so it's resolved once here rather than per user.
     baseline_median_price_eur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     baseline_sample_size: Mapped[int] = mapped_column(Integer, default=0)
     baseline_confidence: Mapped[str] = mapped_column(String, default="none")
+    baseline_computed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    """Gates the shared `resolve_baselines` step the same way `analyzed_at`
+    gates stage 3 -- added post-deployment, see `_ensure_column`."""
+
+    # Legacy (pre-multiuser, 2026-09-04 to 2026-09-05): scoring/gate/notify
+    # used to be single-user singleton values stored directly on the
+    # listing. Superseded by `UserListingScoreRow` -- kept only because
+    # SQLite can't cheaply drop columns; no code reads or writes these
+    # anymore.
     price_component: Mapped[float] = mapped_column(Float, default=0.0)
     condition_component: Mapped[float] = mapped_column(Float, default=0.0)
     score: Mapped[int] = mapped_column(Integer, default=0)
     above_threshold: Mapped[bool] = mapped_column(Boolean, default=False)
     reasoning_json: Mapped[str] = mapped_column(Text, default="[]")
     condition_highlights_json: Mapped[str] = mapped_column(Text, default="[]")
-    """Plain-language versions of `reasoning`'s condition flags, no point
-    deltas — added after `reasoning_json` (see `db/engine.py`'s
-    `_ensure_column` for how this column gets added to an already-deployed
-    DB, since a fresh `create_all` alone wouldn't touch an existing table)."""
     scored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-    # Stage 6: Telegram delivery
     notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class SubscriberRow(Base):
+    """Anyone who has ever messaged the bot -- the set of chat_ids that
+    `do_score`/`do_notify` loop over. Populated by a `group=-1` "middleware"
+    handler in `notifier/bot.py` that runs before every other handler, so
+    subscribing doesn't require remembering to send `/start` specifically."""
+
+    __tablename__ = "subscribers"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class UserListingScoreRow(Base):
+    """The per-subscriber half of scoring a listing -- everything that
+    depends on that person's own `ScoringWeightsRow`/`PipelineSettingsRow`
+    (condition weights, gate thresholds). Deliberately a separate table
+    from `ListingRow` rather than more columns on it: a listing has one
+    market baseline but N scores, one per subscriber."""
+
+    __tablename__ = "user_listing_scores"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    listing_id: Mapped[str] = mapped_column(String, primary_key=True)
+    price_component: Mapped[float] = mapped_column(Float, default=0.0)
+    condition_component: Mapped[float] = mapped_column(Float, default=0.0)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    above_threshold: Mapped[bool] = mapped_column(Boolean, default=False)
+    reasoning_json: Mapped[str] = mapped_column(Text, default="[]")
+    condition_highlights_json: Mapped[str] = mapped_column(Text, default="[]")
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class GlobalScrapeSettingsRow(Base):
+    """Singleton row (always id=1) holding the *one* parameter that
+    genuinely can't be personalized without multiplying scrape cost per
+    distinct value: search radius. There's no per-listing distance-from-hub
+    figure to filter by afterward, so unlike budget/year/mileage/brand/
+    fuel/transmission (all per-subscriber, see `PipelineSettingsRow`),
+    radius has to stay one shared value everyone's search uses. `/radius`
+    still works from Telegram -- it just changes the shared search area,
+    not something personal."""
+
+    __tablename__ = "global_scrape_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    radius_km: Mapped[int] = mapped_column(Integer, default=100)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class PipelineSettingsRow(Base):
-    """Singleton row (always id=1) holding the scrape/gate parameters you
-    can change live via Telegram commands (`/budget`, `/minyear`,
-    `/threshold`, `/radius`, `/settings`) instead of only via CLI flags or
-    a code change — `becarscout run` (what cron actually invokes) reads
-    this at the start of every run. A brand-new table is picked up
-    automatically by `Base.metadata.create_all` even on an
-    already-deployed DB (unlike a new *column* on an existing table,
-    which needs `db/engine.py`'s `_ensure_column` workaround)."""
+    """One row per subscriber (`chat_id`), holding the gate parameters
+    `/budget`, `/minyear`, `/threshold`, `/mileage`, `/make`, `/fuel`,
+    `/transmission` change live. Was a singleton (`id=1`, one set of
+    values for everyone) before multi-user support -- `chat_id` was added
+    to an already-deployed table via `_ensure_column`, so the pre-existing
+    `id=1` row (with `chat_id` left NULL) is simply orphaned going forward;
+    `db/engine.py`'s one-time migration copies its values into a real
+    subscriber's row so an existing single user doesn't lose their
+    settings across the upgrade."""
 
     __tablename__ = "pipeline_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     radius_km: Mapped[int] = mapped_column(Integer, default=100)
+    """Legacy -- radius moved to `GlobalScrapeSettingsRow`. Column kept
+    (unused by new code) for the same can't-easily-drop-it-in-SQLite
+    reason as `ListingRow`'s legacy scoring columns."""
     min_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -95,26 +169,19 @@ class PipelineSettingsRow(Base):
     makes: Mapped[str | None] = mapped_column(String, nullable=True)
     fuel_types: Mapped[str | None] = mapped_column(String, nullable=True)
     transmission: Mapped[str | None] = mapped_column(String, nullable=True)
-    """These four added after the table's first deployment -- see
-    `db/engine.py`'s `_ensure_column` calls for how they get added to an
-    already-populated DB (a plain `create_all` alone only creates missing
-    tables, never adds columns to one that already exists)."""
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ScoringWeightsRow(Base):
-    """Singleton row (always id=1) holding the condition-signal point
-    weights `scoring.py` used to only have as hardcoded module constants.
-    Moved here so `/validate` (see `feedback_agent/`) can actually apply a
-    feedback-derived weight suggestion at runtime, not just print it in a
-    report for you to hand-edit `scoring.py` and redeploy. Every column
-    defaults to exactly what the original hardcoded constant was —
-    nothing changes in scoring behavior until a row is explicitly written
-    here."""
+    """One row per subscriber (`chat_id`), holding the condition-signal
+    point weights `/validate` can change for that person specifically.
+    Was a singleton (`id=1`) before multi-user support -- see
+    `PipelineSettingsRow`'s docstring for the same migration story."""
 
     __tablename__ = "scoring_weights"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     gearbox_issue_likely_major: Mapped[int] = mapped_column(Integer, default=-40)
     gearbox_issue_minor: Mapped[int] = mapped_column(Integer, default=-20)
     gearbox_issue_unknown: Mapped[int] = mapped_column(Integer, default=-20)
@@ -132,3 +199,18 @@ class ScoringWeightsRow(Base):
     for_export: Mapped[int] = mapped_column(Integer, default=-15)
     min_plausible_car_price_eur: Mapped[int] = mapped_column(Integer, default=300)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PendingSuggestionRow(Base):
+    """One row per subscriber -- the structured suggestions from their
+    *last* `/reviewfeedback` run, applied (and cleared) by their next
+    `/validate`. DB-backed rather than the single global JSON file the
+    pre-multiuser version used (`data/feedback/latest_suggestions.json`),
+    since per-chat state belongs in the same place as everything else
+    per-chat now."""
+
+    __tablename__ = "pending_suggestions"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    suggestions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

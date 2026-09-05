@@ -7,6 +7,13 @@ A 7-stage pipeline: scrape Facebook Marketplace → normalize fields → LLM-ext
 condition signals → score against real market comps → gate on a threshold → deliver to
 Telegram → remember your feedback for next time. Runs hourly, unattended, in Docker.
 
+**Multi-user**: anyone who messages the bot gets their own budget, year cutoff,
+pickiness, mileage/brand/fuel/transmission filters, scoring weights, notifications, and
+feedback memory — fully isolated per Telegram chat. Scraping (and its one shared
+parameter, search radius) is the only thing everyone has in common: one shared pool of
+listings, each person's own filter on top. See Project.md's stage 6/7 notes for how the
+split actually works under the hood.
+
 - **Stage 1** (`src/becarscout/scraper/`) — Playwright scraper across 5 Belgian hub cities.
 - **Stage 2** (`src/becarscout/structurer/`) — deterministic regex/keyword extraction
   (price, year, mileage, make, fuel, transmission, location).
@@ -15,20 +22,28 @@ Telegram → remember your feedback for next time. Runs hourly, unattended, in D
   replacement, BTW/margin scheme, export intent, ...).
 - **Stage 4/5** (`src/becarscout/pricing/` + `src/becarscout/scoring/`) — price comps from
   2dehands.be and 2ememain.be (same underlying marketplace, bilingual front-ends — not
-  independent sources, just broader coverage), combined with stage 3's signals into one
-  auditable score + reasoning trail, filtered by a score threshold and a minimum year.
-- **Stage 6** (`src/becarscout/notifier/`) — sends opportunity cards to Telegram with
-  👍/👎 buttons; a separate standing process records button presses.
+  independent sources, just broader coverage) resolve one shared market-price baseline per
+  listing; each subscriber's own condition weights and gate (score threshold, minimum
+  year, mileage, brand, fuel, transmission) then combine with it into their own auditable
+  score + reasoning trail.
+- **Stage 6** (`src/becarscout/notifier/`) — sends each subscriber their own opportunity
+  cards with 👍/👎 buttons; a separate standing process records button presses and
+  subscribes any chat that messages the bot.
 - **Stage 7** (`src/becarscout/feedback_agent/`) — a local mem0 memory store remembers
-  every verdict (so a new card can say "2 similar cars you liked before"), and a small
-  LangGraph agent (`becarscout feedback-review`) turns accumulated feedback into a report
-  of patterns + suggested `scoring.py` tweaks. Advisory only, by design — it never edits
-  `scoring.py` or the Telegram score itself; a human reads the report and decides.
+  every verdict per subscriber (so a new card can say "2 similar cars you liked before"),
+  and a small LangGraph agent (`becarscout feedback-review --chat-id`) turns one
+  subscriber's accumulated feedback into a report of patterns + suggested weight tweaks
+  for them specifically. Advisory only, by design — it never edits scoring on its own;
+  that person reads the report and decides via `/validate`.
 
-**Persistence**: SQLite (`src/becarscout/db/`, one row per listing gaining columns as it
-moves through stages) — this is what makes hourly runs cheap: only genuinely new listings
-get scraped in full detail, sent to Mistral, or scored; everything already processed is
-skipped by a plain `WHERE ... IS NULL` query per stage.
+**Persistence**: SQLite (`src/becarscout/db/`). Scrape/structure/analyze/baseline stay one
+row per listing gaining columns as it moves through stages — this is what makes hourly
+runs cheap: only genuinely new listings get scraped in full detail, sent to Mistral, or
+have their market-price baseline resolved; everything already processed is skipped by a
+plain `WHERE ... IS NULL` query per stage. Scoring, the decision gate, and notifications
+are per-subscriber instead (a separate table keyed by chat_id + listing_id), since two
+people can have different budgets, weights, and thresholds against the exact same shared
+listing.
 
 `src/becarscout/bot/` holds an unrelated, unused Telegram bot skeleton salvaged from an
 earlier prototype (conversational brand/model picker, seller negotiation) — not wired
@@ -48,8 +63,13 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 Get a Mistral key at console.mistral.ai. For Telegram: message **@BotFather** →
-`/newbot` for the token, then message your new bot once and run `uv run becarscout
-whoami` to find your `TELEGRAM_CHAT_ID`.
+`/newbot` for the token. `TELEGRAM_CHAT_ID` is optional now that the bot supports
+multiple people — anyone can just message the bot and send `/start` to subscribe. Set it
+only if you're upgrading a deployment that predates multi-user support: on first startup
+it's used once to carry your existing settings, weights, and already-sent notifications
+over to a real per-chat profile instead of resetting them (see `db/engine.py`'s
+migration). `uv run becarscout whoami` finds a chat_id from recent messages, for this or
+for `--chat-id` on the admin CLI commands below.
 
 **Facebook login is never automated** — a real, visible browser window opens for you to
 log in normally (handles 2FA/checkpoints), and the session is reused after that:
@@ -65,48 +85,51 @@ picks up via the mounted `data/` volume.
 ## Running manually (one stage at a time)
 
 ```bash
-uv run becarscout scrape      # -> new listings into the DB
-uv run becarscout structure   # -> normalizes newly-scraped listings
-uv run becarscout analyze     # -> LLM signals for newly-structured listings
-uv run becarscout score       # -> price/condition score for newly-analyzed listings
-uv run becarscout notify      # -> sends newly-scored opportunities to Telegram
+uv run becarscout scrape      # -> new listings into the DB (shared)
+uv run becarscout structure   # -> normalizes newly-scraped listings (shared)
+uv run becarscout analyze     # -> LLM signals for newly-structured listings (shared)
+uv run becarscout baseline    # -> resolves the shared market-price baseline (stage 4, shared half)
+uv run becarscout score       # -> scores newly-baselined listings for every subscriber
+uv run becarscout notify      # -> sends each subscriber their own newly-scored opportunities
 ```
 
 Each command only processes what the previous stage left behind since the last run —
 re-running `analyze` right after itself does nothing, for example. `scrape` also detects
 when a known listing's price has changed (comparing parsed numbers, not raw text, so
-formatting differences don't cause false positives) and automatically re-scores/
-re-notifies it — a pure description edit with no price change isn't detectable this way
-(would need revisiting every known listing's page every run). Useful `scrape` flags:
-`--radius-km`, `--min-price`/`--max-price`, `--max-scrolls`, `--no-details` (skip detail
-pages, faster/less data), `--headed` (visible browser, for debugging selectors). `score`
-takes `--threshold` (default 20), `--min-year` (default 2010 — cars from that year or
-older never clear the gate regardless of score; `--no-min-year` disables it),
-`--max-mileage-km`, `--makes` (comma-separated, e.g. `bmw,toyota`), `--fuel-types`
-(comma-separated, e.g. `diesel,hybrid`), and `--transmission` (`automatic` or `manual`) —
-all four default to whatever's currently set via `/mileage`/`/make`/`/fuel`/`/transmission`
-on Telegram. `analyze` takes `--model` (default `ministral-8b-latest`) and `--delay`
-(seconds between API calls, default 1.0).
+formatting differences don't cause false positives) and invalidates every subscriber's
+score for it so it flows back through `score`/`notify` — a pure description edit with no
+price change isn't detectable this way (would need revisiting every known listing's page
+every run). Useful `scrape` flags: `--radius-km` (default: current `/radius` setting,
+shared by everyone), `--min-price`/`--max-price` (an admin-only knob that narrows the live
+scrape itself — a subscriber's own `/budget` is a separate filter applied afterward, not
+this), `--max-scrolls`, `--no-details` (skip detail pages, faster/less data), `--headed`
+(visible browser, for debugging selectors). `analyze` takes `--model` (default
+`ministral-8b-latest`) and `--delay` (seconds between API calls, default 1.0). `score` and
+`notify` take no flags at all — they loop over every subscriber internally, using each
+one's own settings/weights (see `/budget`, `/threshold`, etc. below); there's no single
+"the" gate to override from the CLI anymore.
 
 ```bash
-uv run becarscout rescore     # queue every scored listing for re-evaluation with current code
+uv run becarscout rescore [--chat-id ID]    # queue scored listings for re-evaluation with current code
 ```
 
 Incremental processing means a `scoring.py`/`baseline.py` fix only affects listings scored
 *after* it ships — anything already scored keeps its old value until something resets it.
 Run `rescore` then `score` (then `notify`) after a scoring-affecting fix to apply it
 retroactively; `notified_at` is left alone, so this won't cause already-sent opportunities
-to resend on their own.
+to resend on their own. Omit `--chat-id` to re-queue every subscriber.
 
 ```bash
-uv run becarscout listen      # standing process: records 👍/👎 button presses
-uv run becarscout feedback-review   # stage 7: patterns + suggested scoring.py tweaks
+uv run becarscout listen                              # standing process: records 👍/👎, runs the bot
+uv run becarscout feedback-review --chat-id ID         # stage 7: one subscriber's patterns + suggested weight changes
 ```
 
-`feedback-review` needs at least 5 recorded verdicts to say anything (otherwise it tells
-you so and exits) — it reads what `listen` has stored in mem0, writes a report to
-`data/feedback/review_<timestamp>.md`, and prints it. On its own it never changes scoring;
-see the Telegram commands below for the step that does.
+`feedback-review` needs at least 5 recorded verdicts *from that chat_id* to say anything
+(otherwise it tells you so and exits) — it reads what `listen` has stored in mem0 for
+them specifically, writes a report to `data/feedback/review_<chat_id>_<timestamp>.md`,
+and prints it. On its own it never changes scoring; see the Telegram commands below for
+the step that does (the day-to-day equivalent of these last two commands is
+`/reviewfeedback` and `/validate` on Telegram, scoped to whoever sends them).
 
 ## Controlling it from Telegram
 
@@ -117,27 +140,39 @@ startup — see `_post_init` in `notifier/bot.py`), so you don't need to remembe
 names. All bot replies use plain, non-technical language on purpose (no "scrape"/"score"
 pipeline jargon) — anyone can use this without knowing how it works internally.
 
+Every setting below is personal to whoever's chatting — your budget, filters, weights,
+notifications, and feedback are yours alone — **except `/radius`**, which is shared by
+everyone using this bot (there's no per-listing distance figure to filter by afterward, so
+one radius has to define what gets scraped for everyone; see Project.md).
+
 - `/start` or `/help` — a plain-language welcome message explaining what the bot does and
-  how to set it up, with a "🚀 Quick setup" button. Send this first if you're new.
+  how to set it up, with a "🚀 Quick setup" button. Sending this (or really any message)
+  also subscribes you — no separate registration step.
 - `/setup` — a guided flow through the four core settings (budget, min year, radius,
   threshold) one question at a time, instead of tapping four separate `/settings` buttons.
 - `/cancel` — stops whatever it's currently asking you (a pending prompt or an in-progress
   `/setup`) without changing anything.
 - `/find` — runs the full pipeline right now (scrape → structure → analyze → score →
-  notify) instead of waiting for the next hourly cron tick. Shows a "typing…" indicator the
-  whole time so a multi-minute wait doesn't look like the bot froze, and a second `/find`
-  while one's already running just says so instead of starting an overlapping run. Replies
-  immediately, then messages again with a summary once the run finishes.
+  notify) instead of waiting for the next hourly cron tick. Since scraping is shared, this
+  refreshes results for *everyone* using the bot, not just whoever sent it. Shows a
+  "typing…" indicator the whole time so a multi-minute wait doesn't look like the bot
+  froze, and a second `/find` while one's already running just says so instead of starting
+  an overlapping run. Replies immediately, then messages again with a summary once the run
+  finishes.
 - `/search <keyword>` — looks through listings already scraped for a make/model/title
-  match, e.g. `/search golf`. Doesn't scrape anything new — see `/find` for that.
+  match, e.g. `/search golf`, showing your own score for each hit. Add a time range to
+  filter by how recently a listing was found: `/search golf week`, or just `/search today`
+  / `/search 3days` with no keyword to see everything new. Doesn't scrape anything new —
+  see `/find` for that.
 - `/settings` — shows every filter below at once, with buttons to change any of them.
-- `/budget <max>`, `/budget <min> <max>`, or `/budget off` — the price range future scrapes
-  search within.
-- `/minyear <year>` or `/minyear off` — cars from that year or older never reach Telegram,
+- `/budget <max>`, `/budget <min> <max>`, or `/budget off` — your personal price range,
+  applied after the shared scrape (not a live search-query narrower) — see `/radius` above
+  for the one thing that actually is shared.
+- `/minyear <year>` or `/minyear off` — cars from that year or older never reach you,
   regardless of score (default 2010).
-- `/threshold <n>` — the minimum score a listing needs to reach Telegram.
-- `/radius <km>` — search radius around each Belgian hub city.
-- `/mileage <km>` or `/mileage off` — cars with more mileage than that never reach Telegram,
+- `/threshold <n>` — the minimum score a listing needs to reach you.
+- `/radius <km>` — search radius around each Belgian hub city, shared by every subscriber.
+- `/mileage <km>` or `/mileage off` — cars with more mileage than that never reach you,
   regardless of score.
 - `/make <brand, brand, ...>` or `/make off` — only show specific brands, e.g. `/make bmw,
   toyota`. Unlike the filters above, a listing whose brand wasn't detected does *not* pass
@@ -162,9 +197,11 @@ prompt armed rather than silently giving up — just send another try, or `/canc
 out entirely. Any other unhandled error is caught by a bot-wide error handler that tells you
 something went wrong instead of just going silent.
 
-Every setting above takes effect from the *next* scrape/score run onward — cron always
-invokes `becarscout run` with no flags, and it resolves each parameter as
-explicit CLI flag → Telegram-set value → hardcoded default, in that order.
+Every setting above takes effect from the *next* search onward — cron runs the shared
+scrape/structure/analyze/baseline stages once per hour, then scores and notifies every
+subscriber using whatever they currently have set (`radius_km` resolves as
+explicit CLI flag → shared `/radius` value → hardcoded default; every personal filter
+just reads straight from that subscriber's own settings, no CLI override involved).
 
 Run the whole chain in one call (what cron actually invokes):
 
@@ -172,9 +209,9 @@ Run the whole chain in one call (what cron actually invokes):
 uv run becarscout run
 ```
 
-Each of its 5 stages is independently try/excepted — if Facebook changes their markup
-mid-run, already-processed backlog still reaches Telegram instead of the whole run being
-a no-op.
+Each of its 6 stages is independently try/excepted — if Facebook changes their markup
+mid-run, already-processed backlog still reaches every subscriber instead of the whole
+run being a no-op.
 
 ## Running in Docker (the hourly, unattended setup)
 

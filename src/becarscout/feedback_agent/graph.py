@@ -41,9 +41,11 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 DEFAULT_REPORT_DIR = Path(os.getenv("BECARSCOUT_FEEDBACK_REPORT_DIR", "data/feedback"))
-LATEST_SUGGESTIONS_PATH = DEFAULT_REPORT_DIR / "latest_suggestions.json"
-"""Overwritten by every review — `/validate` (see `apply.py`) always acts
-on the *most recent* review's suggestions, not some specific past one."""
+"""Markdown reports still land on disk (one subscriber's plain-English
+read of their own review) -- the *structured* suggestions a `/validate`
+acts on live in the DB instead (`db/models.py`'s `PendingSuggestionRow`,
+keyed by chat_id), since per-chat state belongs alongside everything
+else per-chat now (settings, weights) rather than in per-chat filenames."""
 
 _REVIEW_MODEL = os.getenv("MISTRAL_MODEL", "ministral-8b-latest")
 
@@ -115,22 +117,23 @@ _SUGGESTION_JSON_SCHEMA: dict = {
 }
 
 
-def _current_weights_block() -> str:
-    """Reads the actual current values straight from the DB-backed
-    `ScoringWeights` (see `db/repository.get_scoring_weights`) rather than
-    letting the LLM guess/hallucinate them — a suggestion like "raise X
-    from -10 to -20" is useless (or misleading) if -10 was never the real
-    current value. Reads live values, not hardcoded defaults, so a
-    previously-applied `/validate` is correctly reflected here too."""
+def _current_weights_block(chat_id: int) -> str:
+    """Reads this subscriber's actual current values straight from the
+    DB-backed `ScoringWeights` (see `db/repository.get_scoring_weights`)
+    rather than letting the LLM guess/hallucinate them — a suggestion like
+    "raise X from -10 to -20" is useless (or misleading) if -10 was never
+    the real current value. Reads live values, not hardcoded defaults, so
+    a previously-applied `/validate` is correctly reflected here too."""
     session = get_session()
     try:
-        weights = repo.get_scoring_weights(session)
+        weights = repo.get_scoring_weights(session, chat_id)
     finally:
         session.close()
     return "\n".join(f"{name} = {value}" for name, value in weights.model_dump().items())
 
 
 class ReviewState(TypedDict, total=False):
+    chat_id: int
     memories: list[dict]
     liked: list[dict]
     disliked: list[dict]
@@ -148,8 +151,8 @@ def _get_mistral_client() -> Mistral:
     return Mistral(api_key=api_key)
 
 
-def _load_memories(_state: ReviewState) -> ReviewState:
-    memories = get_all_feedback_memories()
+def _load_memories(state: ReviewState) -> ReviewState:
+    memories = get_all_feedback_memories(state["chat_id"])
     liked = [m for m in memories if m.get("metadata", {}).get("verdict") == "up"]
     disliked = [m for m in memories if m.get("metadata", {}).get("verdict") == "down"]
     return {"memories": memories, "liked": liked, "disliked": disliked}
@@ -178,7 +181,7 @@ def _synthesize(state: ReviewState) -> ReviewState:
     liked_lines = "\n".join(f"- {m['memory']}" for m in state["liked"]) or "(none)"
     disliked_lines = "\n".join(f"- {m['memory']}" for m in state["disliked"]) or "(none)"
     user_prompt = (
-        f"Current scoring weights:\n{_current_weights_block()}\n\n"
+        f"Current scoring weights:\n{_current_weights_block(state['chat_id'])}\n\n"
         f"Liked cars:\n{liked_lines}\n\nDisliked cars:\n{disliked_lines}"
     )
 
@@ -216,13 +219,16 @@ def _synthesize(state: ReviewState) -> ReviewState:
 def _write_report(state: ReviewState) -> ReviewState:
     DEFAULT_REPORT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = DEFAULT_REPORT_DIR / f"review_{timestamp}.md"
+    path = DEFAULT_REPORT_DIR / f"review_{state['chat_id']}_{timestamp}.md"
     path.write_text(state["report_markdown"], encoding="utf-8")
 
-    # Always overwritten -- /validate acts on the latest review only.
-    LATEST_SUGGESTIONS_PATH.write_text(
-        json.dumps(state.get("suggestions", []), ensure_ascii=False), encoding="utf-8"
-    )
+    # Always overwritten -- /validate acts on this subscriber's latest
+    # review only.
+    session = get_session()
+    try:
+        repo.save_pending_suggestions(session, state["chat_id"], state.get("suggestions", []))
+    finally:
+        session.close()
 
     logger.info("Feedback review written to %s (%d suggestion(s))", path, len(state.get("suggestions", [])))
     return {"report_path": str(path)}
@@ -247,11 +253,12 @@ def build_feedback_review_graph():
     return graph.compile()
 
 
-def run_feedback_review() -> ReviewState:
-    """Entry point for `becarscout feedback-review` (and the Telegram
-    `/reviewfeedback` command). Produces a markdown report plus a
-    structured suggestion list saved to `LATEST_SUGGESTIONS_PATH` — see
-    `apply.py`'s `apply_latest_suggestions` for the "/validate" step that
-    actually applies them. Never touches scoring itself on its own."""
+def run_feedback_review(chat_id: int) -> ReviewState:
+    """Entry point for `becarscout feedback-review --chat-id` (and the
+    Telegram `/reviewfeedback` command, where chat_id comes from the
+    message). Produces a markdown report plus a structured suggestion
+    list saved for that subscriber — see `apply.py`'s
+    `apply_latest_suggestions` for the "/validate" step that actually
+    applies them. Never touches scoring itself on its own."""
     app = build_feedback_review_graph()
-    return app.invoke({})
+    return app.invoke({"chat_id": chat_id})

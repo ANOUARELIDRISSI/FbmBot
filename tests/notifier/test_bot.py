@@ -7,14 +7,18 @@ from becarscout.notifier.bot import (
     _PROMPTABLE_COMMANDS,
     _QUICK_PICK_LABELS,
     _QUICK_PICKS,
+    _SEARCH_RANGE_DAYS,
     _WIZARD_STEPS,
     _budget_text,
     _format_search_hit,
     _parse_csv_arg,
     _parse_int_arg,
+    _parse_search_args,
     _quick_pick_keyboard,
+    _search_range_keyboard,
     _summarize_find_output,
 )
+from becarscout.scoring.models import ScoredListing
 from becarscout.settings import PipelineSettings
 
 
@@ -74,8 +78,9 @@ def _make_row(**overrides) -> ListingRow:
 
 
 def test_format_search_hit_includes_stats_and_score():
-    row = _make_row(price_eur=9500, year=2016, mileage_km=120000, score=34, scored_at=datetime.now(timezone.utc))
-    text = _format_search_hit(row)
+    row = _make_row(price_eur=9500, year=2016, mileage_km=120000)
+    scored = ScoredListing(listing_id="l1", url=row.url, raw_title=row.raw_title, score=34, reasoning=[])
+    text = _format_search_hit(row, scored)
     assert "€9,500" in text
     assert "2016" in text
     assert "120,000 km" in text
@@ -84,8 +89,8 @@ def test_format_search_hit_includes_stats_and_score():
 
 
 def test_format_search_hit_marks_unscored_listings():
-    row = _make_row(scored_at=None)
-    text = _format_search_hit(row)
+    row = _make_row()
+    text = _format_search_hit(row, None)
     assert "Not yet scored" in text
 
 
@@ -163,3 +168,27 @@ def test_wizard_steps_are_all_promptable():
 
 def test_wizard_steps_have_no_duplicates():
     assert len(_WIZARD_STEPS) == len(set(_WIZARD_STEPS))
+
+
+def test_parse_search_args_splits_off_a_trailing_range_token():
+    assert _parse_search_args(["golf", "week"]) == ("golf", 7)
+    assert _parse_search_args(["golf"]) == ("golf", None)
+
+
+def test_parse_search_args_range_alone_means_no_keyword():
+    assert _parse_search_args(["today"]) == ("", 1)
+
+
+def test_parse_search_args_multi_word_keyword_before_range():
+    assert _parse_search_args(["land", "rover", "3days"]) == ("land rover", 3)
+
+
+def test_parse_search_args_empty_input():
+    assert _parse_search_args([]) == ("", None)
+
+
+def test_search_range_keyboard_has_one_button_per_range():
+    keyboard = _search_range_keyboard()
+    buttons = keyboard.inline_keyboard[0]
+    assert len(buttons) == len(_SEARCH_RANGE_DAYS)
+    assert all(btn.callback_data.startswith("set:sr:") for btn in buttons)

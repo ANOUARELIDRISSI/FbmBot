@@ -31,9 +31,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MEM0_DIR = os.getenv("BECARSCOUT_MEM0_DIR", "data/mem0/chroma")
 DEFAULT_COLLECTION = "becarscout_feedback"
-OWNER_USER_ID = "owner"
-"""Single-user personal project — one mem0 namespace is enough; not tied
-to a real Telegram user id since there's exactly one person's feedback."""
 
 _MEMORY_LLM_MODEL = "mistral/" + os.getenv("MISTRAL_MODEL", "ministral-8b-latest")
 
@@ -82,41 +79,47 @@ def _describe(listing: ScoredListing) -> str:
     return description
 
 
-def store_feedback_memory(listing: ScoredListing, verdict: str) -> None:
+def store_feedback_memory(listing: ScoredListing, verdict: str, chat_id: int) -> None:
     """Called whenever a \U0001f44d/\U0001f44e comes in (see
     `notifier/bot.py`'s callback handler). Failures are logged, not
     raised — the raw verdict is already safely recorded in
-    `feedback.jsonl` regardless of whether mem0 could also store it."""
+    `feedback.jsonl` regardless of whether mem0 could also store it.
+    `chat_id` is mem0's own `user_id` concept -- one subscriber's
+    memories never show up in another's similarity search or review
+    (see multi-user note in `db/models.py`)."""
     verdict_word = "Liked" if verdict == "up" else "Disliked"
     try:
         get_memory().add(
             f"{verdict_word} this car: {_describe(listing)}",
-            user_id=OWNER_USER_ID,
+            user_id=str(chat_id),
             metadata={"listing_id": listing.listing_id, "verdict": verdict},
         )
     except Exception:
         logger.exception("Failed to store feedback memory for %s", listing.listing_id)
 
 
-def find_similar_feedback(listing: ScoredListing, limit: int = 3) -> list[dict]:
-    """Past verdicts on similar-sounding cars, most relevant first — used
-    to add a "similar to N you liked/disliked before" line to a *new*
-    opportunity card before you decide on it. Never raises: a memory-layer
-    hiccup shouldn't block a notification from going out."""
+def find_similar_feedback(listing: ScoredListing, chat_id: int, limit: int = 3) -> list[dict]:
+    """Past verdicts on similar-sounding cars from this subscriber
+    specifically, most relevant first — used to add a "similar to N you
+    liked/disliked before" line to a *new* opportunity card before you
+    decide on it. Never raises: a memory-layer hiccup shouldn't block a
+    notification from going out."""
     try:
-        result = get_memory().search(_describe(listing), filters={"user_id": OWNER_USER_ID}, top_k=limit)
+        result = get_memory().search(_describe(listing), filters={"user_id": str(chat_id)}, top_k=limit)
     except Exception:
         logger.exception("mem0 search failed for %s — continuing without similarity context", listing.listing_id)
         return []
     return result.get("results", []) if isinstance(result, dict) else list(result)
 
 
-def get_all_feedback_memories() -> list[dict]:
-    """Every stored feedback memory — used by the periodic review agent
-    (`feedback_agent/graph.py`) to look for patterns across everything
-    liked/disliked so far, not just what's similar to one listing."""
+def get_all_feedback_memories(chat_id: int) -> list[dict]:
+    """Every stored feedback memory for one subscriber — used by the
+    periodic review agent (`feedback_agent/graph.py`) to look for
+    patterns across everything *that person* has liked/disliked so far,
+    not just what's similar to one listing, and not mixed in with anyone
+    else's feedback."""
     try:
-        result = get_memory().get_all(filters={"user_id": OWNER_USER_ID}, top_k=1000)
+        result = get_memory().get_all(filters={"user_id": str(chat_id)}, top_k=1000)
     except Exception:
         logger.exception("mem0 get_all failed")
         return []
