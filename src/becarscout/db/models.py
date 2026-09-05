@@ -62,6 +62,11 @@ class ListingRow(Base):
     score: Mapped[int] = mapped_column(Integer, default=0)
     above_threshold: Mapped[bool] = mapped_column(Boolean, default=False)
     reasoning_json: Mapped[str] = mapped_column(Text, default="[]")
+    condition_highlights_json: Mapped[str] = mapped_column(Text, default="[]")
+    """Plain-language versions of `reasoning`'s condition flags, no point
+    deltas — added after `reasoning_json` (see `db/engine.py`'s
+    `_ensure_column` for how this column gets added to an already-deployed
+    DB, since a fresh `create_all` alone wouldn't touch an existing table)."""
     scored_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Stage 6: Telegram delivery

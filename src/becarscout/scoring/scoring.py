@@ -52,7 +52,7 @@ def _price_component(price_eur: int | None, baseline: PriceBaseline) -> tuple[fl
             "(no comparable listings found) — score based on condition signals only."
         ]
 
-    if price_eur < _MIN_PLAUSIBLE_CAR_PRICE_EUR:
+    if price_eur <= _MIN_PLAUSIBLE_CAR_PRICE_EUR:
         return 0.0, [
             f"Price €{price_eur} is below a plausible whole-car threshold "
             f"(€{_MIN_PLAUSIBLE_CAR_PRICE_EUR}) — likely a parts listing or "
@@ -144,15 +144,58 @@ def _condition_component(signals: DescriptionSignals | None) -> tuple[float, lis
     return weighted, reasoning
 
 
-def score_listing(
-    structured: StructuredListing,
-    signals: DescriptionSignals | None,
-    baseline: PriceBaseline,
-) -> ScoredListing:
-    price_component, price_reasoning = _price_component(structured.price_eur, baseline)
-    condition_component, condition_reasoning = _condition_component(signals)
+def _condition_highlights(signals: DescriptionSignals | None) -> list[str]:
+    """Plain-language, no-numbers versions of the same flags
+    `_condition_component` scores — this is what the Telegram card shows
+    by default (see `notifier/formatting.py`); the point-by-point
+    breakdown above is reserved for the on-demand "Why?" explanation, so
+    the default card reads like a person describing the car, not a ledger."""
+    if signals is None or signals.extraction_failed:
+        return []
 
-    return ScoredListing(
+    highlights: list[str] = []
+
+    if signals.gearbox_issue:
+        note = " (major)" if signals.gearbox_issue_severity == "likely_major" else ""
+        highlights.append(f"\U0001f527 Gearbox needs attention{note}")
+
+    if signals.engine_issue:
+        note = " (major)" if signals.engine_issue_severity == "likely_major" else ""
+        highlights.append(f"\U0001f527 Engine issue mentioned{note}")
+
+    if signals.accident_damage:
+        highlights.append("\U0001f4a5 Accident/body damage mentioned")
+
+    if signals.warning_light:
+        if signals.needs_diagnostic:
+            highlights.append("⚠️ Warning light on — needs diagnostic")
+        else:
+            highlights.append("⚠️ Warning light mentioned")
+
+    if signals.timing_belt_replaced:
+        highlights.append("✅ New timing belt")
+
+    if signals.inspection_valid is True:
+        highlights.append("✅ Valid inspection (keuringsbewijs aanwezig)")
+    elif signals.inspection_valid is False:
+        highlights.append("❌ Inspection not valid")
+
+    if signals.service_history == "complete":
+        highlights.append("✅ Full service history")
+    elif signals.service_history == "none":
+        highlights.append("❌ No service history")
+
+    if signals.for_export:
+        highlights.append("\U0001f4e6 Listed for export")
+
+    return highlights
+
+
+def _base_listing_fields(structured: StructuredListing, baseline: PriceBaseline) -> dict:
+    """Fields every `ScoredListing` needs regardless of which path below
+    computed the score — kept in one place so the not-a-whole-vehicle
+    short-circuit can't drift out of sync with the normal path."""
+    return dict(
         listing_id=structured.listing_id,
         url=structured.url,
         raw_title=structured.raw_title,
@@ -161,9 +204,43 @@ def score_listing(
         model_hint=structured.model_hint,
         year=structured.year,
         mileage_km=structured.mileage_km,
+        fuel_type=structured.fuel_type,
+        transmission=structured.transmission,
         baseline_median_price_eur=baseline.median_price_eur,
         baseline_sample_size=baseline.sample_size,
         baseline_confidence=baseline.confidence,
+    )
+
+
+def score_listing(
+    structured: StructuredListing,
+    signals: DescriptionSignals | None,
+    baseline: PriceBaseline,
+) -> ScoredListing:
+    # A real bug found via live Telegram output: a listing titled "2006
+    # Subaru outback" was actually someone selling seats pulled from one,
+    # priced at exactly the €300 floor (see _MIN_PLAUSIBLE_CAR_PRICE_EUR,
+    # which only guards price — this guards content). Nothing about the
+    # title alone flagged it; only stage 3 reading the description can.
+    if signals is not None and not signals.extraction_failed and not signals.is_whole_vehicle:
+        return ScoredListing(
+            **_base_listing_fields(structured, baseline),
+            condition_highlights=[],
+            price_component=0.0,
+            condition_component=0.0,
+            score=0,
+            reasoning=[
+                "Listing doesn't appear to be a whole vehicle (parts/accessories only, "
+                "per the description) — not scored as a car deal."
+            ],
+        )
+
+    price_component, price_reasoning = _price_component(structured.price_eur, baseline)
+    condition_component, condition_reasoning = _condition_component(signals)
+
+    return ScoredListing(
+        **_base_listing_fields(structured, baseline),
+        condition_highlights=_condition_highlights(signals),
         price_component=price_component,
         condition_component=condition_component,
         score=round(price_component + condition_component),

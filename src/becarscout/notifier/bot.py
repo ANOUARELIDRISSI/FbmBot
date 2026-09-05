@@ -23,7 +23,7 @@ from becarscout.feedback_agent.memory import find_similar_feedback, store_feedba
 from becarscout.scoring.models import ScoredListing
 
 from .feedback import record_feedback
-from .formatting import format_opportunity_message
+from .formatting import format_opportunity_message, format_score_explanation
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,7 @@ def _keyboard(listing_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("👍", callback_data=f"{CALLBACK_PREFIX}:up:{listing_id}"),
                 InlineKeyboardButton("👎", callback_data=f"{CALLBACK_PREFIX}:down:{listing_id}"),
+                InlineKeyboardButton("ℹ️ Why?", callback_data=f"{CALLBACK_PREFIX}:why:{listing_id}"),
             ]
         ]
     )
@@ -125,6 +126,14 @@ async def send_new_opportunities(opportunities: list[ScoredListing]) -> list[str
     return sent_ids
 
 
+def _fetch_scored_listing(listing_id: str) -> ScoredListing | None:
+    session = get_session()
+    try:
+        return repo.get_scored_listing(session, listing_id)
+    finally:
+        session.close()
+
+
 async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -137,12 +146,20 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
         logger.warning("Malformed callback data: %r", query.data)
         return
 
+    if verdict == "why":
+        # Not feedback — just reveals the full point-by-point breakdown
+        # kept out of the default card (see formatting.py). Leaves the
+        # buttons in place so 👍/👎 is still available afterwards.
+        scored = _fetch_scored_listing(listing_id)
+        if scored is not None and query.message:
+            try:
+                await query.message.reply_text(format_score_explanation(scored), parse_mode="Markdown")
+            except Exception:
+                logger.exception("Failed to send score explanation for %s", listing_id)
+        return
+
     record_feedback(listing_id, verdict)
-    session = get_session()
-    try:
-        scored = repo.get_scored_listing(session, listing_id)
-    finally:
-        session.close()
+    scored = _fetch_scored_listing(listing_id)
     if scored is not None:
         store_feedback_memory(scored, verdict)
     else:

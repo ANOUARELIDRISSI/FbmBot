@@ -187,6 +187,7 @@ def save_scores(session: Session, scored_list: list[ScoredListing]) -> None:
         row.score = scored.score
         row.above_threshold = scored.above_threshold
         row.reasoning_json = json.dumps(scored.reasoning)
+        row.condition_highlights_json = json.dumps(scored.condition_highlights)
         row.scored_at = _now()
     session.commit()
 
@@ -201,6 +202,9 @@ def _row_to_scored(row: ListingRow) -> ScoredListing:
         model_hint=row.model_hint,
         year=row.year,
         mileage_km=row.mileage_km,
+        fuel_type=row.fuel_type,
+        transmission=row.transmission,
+        condition_highlights=json.loads(row.condition_highlights_json) if row.condition_highlights_json else [],
         baseline_median_price_eur=row.baseline_median_price_eur,
         baseline_sample_size=row.baseline_sample_size,
         baseline_confidence=row.baseline_confidence,

@@ -1,8 +1,10 @@
 """Formats a `ScoredListing` into the Telegram card described in
-Project.md stage 6: photo/price/key stats, the reasoning trail as "why
-this scored well / what to watch out for," and a link. No new judgment
-happens here — it's a direct rendering of stage 4's already-computed
-score and reasoning.
+Project.md stage 6. The default card (`format_opportunity_message`) is
+deliberately scannable: title, key stats, plain-language condition
+highlights — no point deltas. The full point-by-point breakdown
+(`format_score_explanation`) is a separate message, sent only when the
+"Why?" button is tapped (see `notifier/bot.py`), so a quick glance at
+Telegram doesn't mean reading a wall of numbers first.
 """
 
 from __future__ import annotations
@@ -20,22 +22,41 @@ def format_opportunity_message(listing: ScoredListing, similar_feedback: list[di
         stats.append(str(listing.year))
     if listing.mileage_km is not None:
         stats.append(f"{listing.mileage_km:,} km")
+    if listing.fuel_type is not None:
+        stats.append(listing.fuel_type.capitalize())
+    if listing.transmission is not None:
+        stats.append(listing.transmission.capitalize())
     if stats:
         lines.append(_escape(" · ".join(stats)))
 
-    if listing.reasoning:
+    if listing.condition_highlights:
         lines.append("")
-        lines.append("_Why:_")
-        for reason in listing.reasoning:
-            lines.append(f"• {_escape(reason)}")
+        for highlight in listing.condition_highlights:
+            lines.append(_escape(highlight))
 
     if similar_feedback:
         lines.append("")
         lines.append(_escape(_similar_feedback_note(similar_feedback)))
 
     lines.append("")
+    lines.append(_escape("Tap ℹ️ Why? below for the full price/condition breakdown."))
     lines.append(listing.url)
 
+    return "\n".join(lines)
+
+
+def format_score_explanation(listing: ScoredListing) -> str:
+    """The full point-by-point reasoning trail behind `listing.score` —
+    sent as a follow-up reply when the "Why?" inline button is tapped
+    (see `notifier/bot.py`'s callback handler). Kept out of the default
+    card so a quick glance at Telegram isn't a wall of numbers."""
+    lines = [f"*Why {_escape(listing.raw_title)} scored {listing.score:+d}:*"]
+    if listing.reasoning:
+        lines.append("")
+        for reason in listing.reasoning:
+            lines.append(f"• {_escape(reason)}")
+    else:
+        lines.append("No detailed reasoning available.")
     return "\n".join(lines)
 
 

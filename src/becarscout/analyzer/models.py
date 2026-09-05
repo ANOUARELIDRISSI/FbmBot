@@ -33,6 +33,16 @@ class DescriptionSignalFields(BaseModel):
     accident_damage: bool = False
     timing_belt_replaced: bool = False
 
+    is_whole_vehicle: bool = True
+    """False when the listing is clearly not a whole vehicle for sale — e.g.
+    seats/wheels/an engine/other parts pulled from a car, with no vehicle
+    actually included. A whole car explicitly sold "for parts" (non-running,
+    but the actual vehicle is what's being sold) still counts as True; this
+    is specifically for listings where no vehicle is being sold at all. Real
+    case that motivated this field: a listing titled "2006 Subaru outback"
+    whose description was "Seats for 2006-2008 Subaru outback... 300 for
+    all" — nothing about the title alone flagged it as non-car."""
+
     inspection_valid: bool | None = None
     """Belgian roadworthiness inspection (keuring / contrôle technique)."""
     service_history: Literal["complete", "partial", "none", "unknown"] = "unknown"

@@ -29,6 +29,19 @@ def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
     cursor.close()
 
 
+def _ensure_column(engine, table: str, column: str, ddl_type: str) -> None:
+    """`Base.metadata.create_all` only creates missing *tables*, never adds
+    columns to one that already exists on disk — this project has no
+    Alembic wired to the real schema yet (see next_version.md), so a new
+    column on an already-deployed DB needs this instead. Safe to call on
+    every startup: a no-op once the column exists."""
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+            conn.commit()
+
+
 def _ensure_initialized() -> None:
     global _engine, _SessionLocal
     if _engine is not None:
@@ -37,6 +50,7 @@ def _ensure_initialized() -> None:
     _engine = create_engine(f"sqlite:///{DEFAULT_DB_PATH}", echo=False)
     event.listens_for(_engine, "connect")(_set_sqlite_pragma)
     Base.metadata.create_all(bind=_engine)
+    _ensure_column(_engine, "listings", "condition_highlights_json", "TEXT DEFAULT '[]'")
     _SessionLocal = sessionmaker(bind=_engine)
 
 

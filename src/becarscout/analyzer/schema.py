@@ -22,6 +22,7 @@ SIGNALS_JSON_SCHEMA: dict = {
         "engine_issue_severity": {"type": ["string", "null"], "enum": ["minor", "likely_major", "unknown", None]},
         "accident_damage": {"type": "boolean"},
         "timing_belt_replaced": {"type": "boolean"},
+        "is_whole_vehicle": {"type": "boolean"},
         "inspection_valid": {"type": ["boolean", "null"]},
         "service_history": {"type": "string", "enum": ["complete", "partial", "none", "unknown"]},
         "vat_scheme": {"type": "string", "enum": ["normal", "margin", "unknown"]},
@@ -34,8 +35,9 @@ SIGNALS_JSON_SCHEMA: dict = {
     "required": [
         "language", "warning_light", "warning_light_severity", "needs_diagnostic",
         "gearbox_issue", "gearbox_issue_severity", "engine_issue", "engine_issue_severity",
-        "accident_damage", "timing_belt_replaced", "inspection_valid", "service_history",
-        "vat_scheme", "for_export", "fuel_type", "transmission", "mileage_km", "confidence",
+        "accident_damage", "timing_belt_replaced", "is_whole_vehicle", "inspection_valid",
+        "service_history", "vat_scheme", "for_export", "fuel_type", "transmission",
+        "mileage_km", "confidence",
     ],
     "additionalProperties": False,
 }
@@ -47,6 +49,11 @@ abbreviations. Extract ONLY what is stated or clearly implied by the text — ne
 guess, and never judge whether the car is a good deal; that is not your job.
 
 Field guide:
+- is_whole_vehicle: false ONLY if no actual vehicle is being sold — e.g. the listing \
+is for seats, wheels, an engine, or other parts pulled from a car ("Seats for 2006 \
+Subaru outback... 300 for all" -> false). A real car being sold non-running or \
+explicitly "for parts" (the whole vehicle, just not driveable) is still true. \
+Default true; only set false when the description makes clear no vehicle is included.
 - warning_light / warning_light_severity / needs_diagnostic: e.g. "motor lampje \
 soms aan" (dashboard warning light sometimes on)
 - gearbox_issue / gearbox_issue_severity: e.g. "versnellingsbak heeft aandacht \
