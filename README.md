@@ -102,7 +102,30 @@ uv run becarscout feedback-review   # stage 7: patterns + suggested scoring.py t
 
 `feedback-review` needs at least 5 recorded verdicts to say anything (otherwise it tells
 you so and exits) — it reads what `listen` has stored in mem0, writes a report to
-`data/feedback/review_<timestamp>.md`, and prints it. It never edits `scoring.py` itself.
+`data/feedback/review_<timestamp>.md`, and prints it. On its own it never changes scoring;
+see the Telegram commands below for the step that does.
+
+## Controlling it from Telegram
+
+Once `becarscout listen` is running (it's always running in Docker), these commands work
+straight from the chat — no SSH, no redeploy:
+
+- `/settings` — shows the current radius, budget, min year, and score threshold at once.
+- `/budget <max>`, `/budget <min> <max>`, or `/budget off` — the price range future scrapes
+  search within.
+- `/minyear <year>` or `/minyear off` — cars from that year or older never reach Telegram,
+  regardless of score (default 2010).
+- `/threshold <n>` — the minimum score a listing needs to reach Telegram.
+- `/radius <km>` — search radius around each Belgian hub city.
+- `/reviewfeedback` — runs stage 7's review agent over your accumulated 👍/👎 and posts the
+  patterns + suggested scoring weight changes it found.
+- `/validate` — applies the *last* `/reviewfeedback`'s suggestions for real. This is the
+  only command that changes scoring behavior; everything else in stage 7 is advisory until
+  you send this. Nothing is applied automatically, ever.
+
+Every setting above takes effect from the *next* scrape/score run onward — cron always
+invokes `becarscout run` with no flags, and it resolves each parameter as
+explicit CLI flag → Telegram-set value → hardcoded default, in that order.
 
 Run the whole chain in one call (what cron actually invokes):
 

@@ -16,11 +16,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from becarscout.analyzer.models import DescriptionSignals
-from becarscout.scoring.models import ScoredListing
+from becarscout.scoring.models import ScoredListing, ScoringWeights
 from becarscout.scraper.models import RawListing
+from becarscout.settings import PipelineSettings
 from becarscout.structurer.models import StructuredListing
 
-from .models import ListingRow
+from .models import ListingRow, PipelineSettingsRow, ScoringWeightsRow
 
 
 def _now() -> datetime:
@@ -308,3 +309,74 @@ def reset_scoring_for_rescore(session: Session) -> int:
             row.scored_at = None
     session.commit()
     return len(result)
+
+
+def get_pipeline_settings(session: Session) -> PipelineSettings:
+    """Current scrape/gate parameters — `becarscout run` (and every
+    individual stage command) reads this at the start of a run and uses
+    it as the default for any parameter not explicitly overridden by a
+    CLI flag. No row yet (nothing has ever been changed via Telegram)
+    just means the hardcoded defaults in `settings.py`."""
+    row = session.get(PipelineSettingsRow, 1)
+    if row is None:
+        return PipelineSettings()
+    return PipelineSettings(
+        radius_km=row.radius_km,
+        min_price=row.min_price,
+        max_price=row.max_price,
+        min_year=row.min_year,
+        threshold=row.threshold if row.threshold is not None else PipelineSettings().threshold,
+    )
+
+
+def update_pipeline_settings(session: Session, **changes: object) -> PipelineSettings:
+    """Partial update — only the given fields change; anything not
+    passed keeps its current stored value (or the hardcoded default, on
+    the very first change ever made). Backs `/budget`, `/minyear`,
+    `/threshold`, `/radius`. `min_year=None` is a valid, meaningful
+    change (disables the year cutoff entirely — see `scoring/gate.py`),
+    not "leave unset"; only keys actually present in `changes` are
+    touched."""
+    row = session.get(PipelineSettingsRow, 1)
+    if row is None:
+        current = PipelineSettings()
+        row = PipelineSettingsRow(
+            id=1,
+            radius_km=current.radius_km,
+            min_price=current.min_price,
+            max_price=current.max_price,
+            min_year=current.min_year,
+            threshold=current.threshold,
+        )
+        session.add(row)
+    for key, value in changes.items():
+        setattr(row, key, value)
+    row.updated_at = _now()
+    session.commit()
+    return get_pipeline_settings(session)
+
+
+def get_scoring_weights(session: Session) -> ScoringWeights:
+    """Current condition-signal point weights. No row yet means nothing
+    has ever been changed via `/validate` — the hardcoded original
+    values from `scoring/models.py`'s `ScoringWeights` defaults."""
+    row = session.get(ScoringWeightsRow, 1)
+    if row is None:
+        return ScoringWeights()
+    return ScoringWeights(**{name: getattr(row, name) for name in ScoringWeights.model_fields})
+
+
+def update_scoring_weights(session: Session, **changes: int) -> ScoringWeights:
+    """Partial update, same pattern as `update_pipeline_settings` —
+    backs `/validate` applying an approved feedback suggestion. Only the
+    named weights change; everything else keeps its current value."""
+    row = session.get(ScoringWeightsRow, 1)
+    if row is None:
+        current = ScoringWeights()
+        row = ScoringWeightsRow(id=1, **current.model_dump())
+        session.add(row)
+    for key, value in changes.items():
+        setattr(row, key, value)
+    row.updated_at = _now()
+    session.commit()
+    return get_scoring_weights(session)

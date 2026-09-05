@@ -117,3 +117,60 @@ def test_reset_scoring_for_rescore_leaves_notified_at_alone(session):
     repo.reset_scoring_for_rescore(session)
 
     assert session.get(ListingRow, "l1").notified_at is not None
+
+
+# --- pipeline settings (/budget, /minyear, /threshold, /radius) ---
+
+
+def test_get_pipeline_settings_defaults_when_never_set(session):
+    settings = repo.get_pipeline_settings(session)
+    assert settings.radius_km == 100
+    assert settings.min_year == 2010
+    assert settings.threshold == 20
+    assert settings.min_price is None
+    assert settings.max_price is None
+
+
+def test_update_pipeline_settings_partial_update_preserves_other_fields(session):
+    repo.update_pipeline_settings(session, max_price=15000)
+    repo.update_pipeline_settings(session, threshold=30)
+
+    settings = repo.get_pipeline_settings(session)
+    assert settings.max_price == 15000
+    assert settings.threshold == 30
+    assert settings.radius_km == 100  # untouched, still the default
+
+
+def test_update_pipeline_settings_can_explicitly_disable_min_year(session):
+    repo.update_pipeline_settings(session, min_year=None)
+    assert repo.get_pipeline_settings(session).min_year is None
+
+
+def test_update_pipeline_settings_budget_range(session):
+    repo.update_pipeline_settings(session, min_price=3000, max_price=12000)
+    settings = repo.get_pipeline_settings(session)
+    assert (settings.min_price, settings.max_price) == (3000, 12000)
+
+
+# --- scoring weights (/validate) ---
+
+
+def test_get_scoring_weights_defaults_when_never_set(session):
+    weights = repo.get_scoring_weights(session)
+    assert weights.for_export == -15
+    assert weights.gearbox_issue_likely_major == -40
+
+
+def test_update_scoring_weights_partial_update(session):
+    repo.update_scoring_weights(session, warning_light_needs_diagnostic=-30)
+    weights = repo.get_scoring_weights(session)
+    assert weights.warning_light_needs_diagnostic == -30
+    assert weights.for_export == -15  # untouched
+
+
+def test_update_scoring_weights_twice_accumulates(session):
+    repo.update_scoring_weights(session, accident_damage=-35)
+    repo.update_scoring_weights(session, for_export=-20)
+    weights = repo.get_scoring_weights(session)
+    assert weights.accident_damage == -35
+    assert weights.for_export == -20

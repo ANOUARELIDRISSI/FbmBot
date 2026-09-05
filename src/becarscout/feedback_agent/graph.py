@@ -1,12 +1,14 @@
 """Stage [7]'s review agent: a small LangGraph graph that turns accumulated
 👍/👎 feedback (via `memory.py`'s mem0 store) into a human-readable report
-of patterns plus *suggested* `scoring.py` weight tweaks — advisory only.
+of patterns plus *suggested* `scoring.py` weight tweaks.
 
 Per the design decision behind this stage (see Project.md): the agent never
-edits `scoring.py` itself and never changes what gets sent to Telegram.
-It only writes a markdown report for you to read and decide on manually —
-the same "LLM interprets, a human/deterministic step judges" principle
-stages 3-5 already follow, just applied one level up (patterns across many
+changes anything by itself. It writes a markdown report **and** a
+structured list of weight suggestions; a human decides whether to act on
+them — either by hand, or via the Telegram `/validate` command (see
+`apply.py`), which applies exactly what this graph proposed, nothing more.
+Same "LLM interprets, a human/deterministic step judges" principle stages
+3-5 already follow, just applied one level up (patterns across many
 verdicts, instead of facts within one description).
 
 Two nodes gate on whether there's enough signal to say anything useful
@@ -17,6 +19,7 @@ noise dressed up as insight.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -27,7 +30,9 @@ from dotenv import load_dotenv
 from langgraph.graph import END, StateGraph
 from mistralai.client import Mistral
 
-from becarscout.scoring import scoring as scoring_constants
+from becarscout.db import get_session
+from becarscout.db import repository as repo
+from becarscout.scoring.models import ScoringWeights
 
 from .memory import get_all_feedback_memories
 
@@ -36,6 +41,10 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 DEFAULT_REPORT_DIR = Path(os.getenv("BECARSCOUT_FEEDBACK_REPORT_DIR", "data/feedback"))
+LATEST_SUGGESTIONS_PATH = DEFAULT_REPORT_DIR / "latest_suggestions.json"
+"""Overwritten by every review — `/validate` (see `apply.py`) always acts
+on the *most recent* review's suggestions, not some specific past one."""
+
 _REVIEW_MODEL = os.getenv("MISTRAL_MODEL", "ministral-8b-latest")
 
 _MIN_FEEDBACK_FOR_REVIEW = 5
@@ -43,67 +52,82 @@ _MIN_FEEDBACK_FOR_REVIEW = 5
 almost certainly noise, not signal — the graph short-circuits to a plain
 "not enough data yet" result instead of fabricating suggestions."""
 
-_SYSTEM_PROMPT = """You are a review assistant for a personal used-car deal-finder. \
-You're given a list of cars the user marked "liked" (👍) and "disliked" (👎) after seeing \
-them as scored opportunities. Your job is only to describe patterns and suggest \
-possible scoring adjustments — you never decide anything, the user reviews and applies \
-changes manually.
+_WEIGHT_FIELDS = list(ScoringWeights.model_fields.keys())
 
-Write a short markdown report with exactly two sections:
-
-## Patterns observed
-2-5 bullet points on what the liked cars have in common and/or what the disliked cars \
-have in common (price range, mileage, make, mentioned condition issues, etc). If nothing \
-meaningful stands out, say so plainly instead of inventing a pattern.
-
-## Suggested scoring.py adjustments
-Only suggest changes to constants from this list, using their actual meaning below — do \
-not invent new constants or repurpose one for something it doesn't control:
-- _GEARBOX_ISSUE, _ENGINE_ISSUE: point penalty dict by severity (likely_major/minor/unknown) \
-when the description mentions that kind of issue.
-- _ACCIDENT_DAMAGE: flat penalty when accident/body damage is mentioned.
-- _WARNING_LIGHT_NEEDS_DIAGNOSTIC, _WARNING_LIGHT_ONLY: penalty when a dashboard warning \
+_WEIGHT_MEANINGS = """\
+- gearbox_issue_likely_major / gearbox_issue_minor / gearbox_issue_unknown: point penalty \
+by severity when the description mentions a gearbox issue.
+- engine_issue_likely_major / engine_issue_minor / engine_issue_unknown: same, for engine issues.
+- accident_damage: flat penalty when accident/body damage is mentioned.
+- warning_light_needs_diagnostic / warning_light_only: penalty when a dashboard warning \
 light is mentioned, split by whether it needs a diagnostic.
-- _TIMING_BELT_REPLACED: flat bonus when a timing belt replacement is mentioned.
-- _INSPECTION_VALID, _INSPECTION_INVALID: bonus/penalty for BE roadworthiness inspection \
+- timing_belt_replaced: flat bonus when a timing belt replacement is mentioned.
+- inspection_valid / inspection_invalid: bonus/penalty for BE roadworthiness inspection \
 (keuring/contrôle technique) status.
-- _SERVICE_HISTORY_COMPLETE, _SERVICE_HISTORY_NONE: bonus/penalty for service history \
-completeness.
-- _FOR_EXPORT: penalty when the listing is marked for export.
-- _MIN_PLAUSIBLE_CAR_PRICE_EUR: a sanity floor (currently €300) below which a price is \
-assumed to be a placeholder/parts listing, not a real asking price — only suggest \
-changing this if liked/disliked cars show genuine placeholder pricing near the current \
-floor, not as a way to express a preferred price range.
-
-For each suggestion, give the constant name and a concrete before/after value, using the \
-CURRENT VALUES given to you in the user message as the "before" — never guess or assume a \
-current value. If the data doesn't support a specific, well-reasoned change to one of these \
-constants, say "No confident suggestions yet" instead of guessing.
+- service_history_complete / service_history_none: bonus/penalty for service history completeness.
+- for_export: penalty when the listing is marked for export.
+- min_plausible_car_price_eur: a sanity floor below which a price is assumed to be a \
+placeholder/parts listing, not a real asking price — only suggest changing this if liked/\
+disliked cars show genuine placeholder pricing near the current floor, not as a way to \
+express a preferred price range.\
 """
 
-_TUNABLE_CONSTANTS = (
-    "_GEARBOX_ISSUE",
-    "_ENGINE_ISSUE",
-    "_ACCIDENT_DAMAGE",
-    "_WARNING_LIGHT_NEEDS_DIAGNOSTIC",
-    "_WARNING_LIGHT_ONLY",
-    "_TIMING_BELT_REPLACED",
-    "_INSPECTION_VALID",
-    "_INSPECTION_INVALID",
-    "_SERVICE_HISTORY_COMPLETE",
-    "_SERVICE_HISTORY_NONE",
-    "_FOR_EXPORT",
-    "_MIN_PLAUSIBLE_CAR_PRICE_EUR",
-)
+_SYSTEM_PROMPT = f"""You are a review assistant for a personal used-car deal-finder. \
+You're given a list of cars the user marked "liked" (👍) and "disliked" (👎) after seeing \
+them as scored opportunities, plus the current value of every scoring weight you're allowed \
+to suggest changing. Your job is only to describe patterns and suggest possible scoring \
+adjustments — you never decide anything; a human reviews your suggestions and chooses \
+whether to apply them.
+
+Only suggest changes to weights from this list, using their actual meaning below — never \
+invent a new weight name or repurpose one for something it doesn't control:
+{_WEIGHT_MEANINGS}
+
+For each suggestion, use the CURRENT VALUE given to you in the user message as
+`current_value` — never guess or assume it. Only propose a change you have reasonable
+confidence in from the actual liked/disliked data; if nothing supports a specific change,
+return an empty suggestions list rather than guessing. List 2-5 patterns you actually
+observed in `patterns_observed`; if nothing meaningful stands out, say so plainly there
+instead of inventing one.
+"""
+
+_SUGGESTION_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "patterns_observed": {"type": "array", "items": {"type": "string"}},
+        "suggestions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "weight": {"type": "string", "enum": _WEIGHT_FIELDS},
+                    "current_value": {"type": "integer"},
+                    "new_value": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["weight", "current_value", "new_value", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["patterns_observed", "suggestions"],
+    "additionalProperties": False,
+}
 
 
-def _current_constants_block() -> str:
-    """Reads the actual current values straight from `scoring.py` rather
-    than letting the LLM guess/hallucinate them — a suggestion like
-    "raise X from -10 to -20" is useless (or misleading) if -10 was never
-    the real current value."""
-    lines = [f"{name} = {getattr(scoring_constants, name)!r}" for name in _TUNABLE_CONSTANTS]
-    return "\n".join(lines)
+def _current_weights_block() -> str:
+    """Reads the actual current values straight from the DB-backed
+    `ScoringWeights` (see `db/repository.get_scoring_weights`) rather than
+    letting the LLM guess/hallucinate them — a suggestion like "raise X
+    from -10 to -20" is useless (or misleading) if -10 was never the real
+    current value. Reads live values, not hardcoded defaults, so a
+    previously-applied `/validate` is correctly reflected here too."""
+    session = get_session()
+    try:
+        weights = repo.get_scoring_weights(session)
+    finally:
+        session.close()
+    return "\n".join(f"{name} = {value}" for name, value in weights.model_dump().items())
 
 
 class ReviewState(TypedDict, total=False):
@@ -112,6 +136,7 @@ class ReviewState(TypedDict, total=False):
     disliked: list[dict]
     report_markdown: str
     report_path: str
+    suggestions: list[dict]
     skipped: bool
     skip_reason: str
 
@@ -153,7 +178,7 @@ def _synthesize(state: ReviewState) -> ReviewState:
     liked_lines = "\n".join(f"- {m['memory']}" for m in state["liked"]) or "(none)"
     disliked_lines = "\n".join(f"- {m['memory']}" for m in state["disliked"]) or "(none)"
     user_prompt = (
-        f"Current scoring.py values:\n{_current_constants_block()}\n\n"
+        f"Current scoring weights:\n{_current_weights_block()}\n\n"
         f"Liked cars:\n{liked_lines}\n\nDisliked cars:\n{disliked_lines}"
     )
 
@@ -165,8 +190,27 @@ def _synthesize(state: ReviewState) -> ReviewState:
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.2,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "feedback_review", "schema": _SUGGESTION_JSON_SCHEMA, "strict": True},
+        },
     )
-    return {"report_markdown": response.choices[0].message.content}
+    parsed = json.loads(response.choices[0].message.content)
+    suggestions = parsed.get("suggestions", [])
+
+    report_lines = ["## Patterns observed"]
+    report_lines.extend(f"- {p}" for p in parsed.get("patterns_observed", []))
+    report_lines.append("")
+    report_lines.append("## Suggested scoring adjustments")
+    if suggestions:
+        for s in suggestions:
+            report_lines.append(f"- `{s['weight']}`: {s['current_value']} -> {s['new_value']} ({s['reason']})")
+        report_lines.append("")
+        report_lines.append("Send /validate on Telegram to apply these, or leave them and they'll be replaced by the next review.")
+    else:
+        report_lines.append("No confident suggestions yet.")
+
+    return {"report_markdown": "\n".join(report_lines), "suggestions": suggestions}
 
 
 def _write_report(state: ReviewState) -> ReviewState:
@@ -174,7 +218,13 @@ def _write_report(state: ReviewState) -> ReviewState:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = DEFAULT_REPORT_DIR / f"review_{timestamp}.md"
     path.write_text(state["report_markdown"], encoding="utf-8")
-    logger.info("Feedback review written to %s", path)
+
+    # Always overwritten -- /validate acts on the latest review only.
+    LATEST_SUGGESTIONS_PATH.write_text(
+        json.dumps(state.get("suggestions", []), ensure_ascii=False), encoding="utf-8"
+    )
+
+    logger.info("Feedback review written to %s (%d suggestion(s))", path, len(state.get("suggestions", [])))
     return {"report_path": str(path)}
 
 
@@ -198,8 +248,10 @@ def build_feedback_review_graph():
 
 
 def run_feedback_review() -> ReviewState:
-    """Entry point for `becarscout feedback-review`. Advisory only — never
-    touches `scoring.py`; just produces a markdown report for you to read
-    and decide whether to act on."""
+    """Entry point for `becarscout feedback-review` (and the Telegram
+    `/reviewfeedback` command). Produces a markdown report plus a
+    structured suggestion list saved to `LATEST_SUGGESTIONS_PATH` — see
+    `apply.py`'s `apply_latest_suggestions` for the "/validate" step that
+    actually applies them. Never touches scoring itself on its own."""
     app = build_feedback_review_graph()
     return app.invoke({})

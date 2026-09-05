@@ -15,7 +15,7 @@ from becarscout.pricing.comps_2dehands import get_comps_cached
 from becarscout.pricing.models import PriceBaseline
 from becarscout.structurer.models import StructuredListing
 
-from .models import ScoredListing
+from .models import DEFAULT_WEIGHTS, ScoredListing, ScoringWeights
 from .scoring import score_listing
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ async def _resolve_baseline(listing: StructuredListing, browser: Browser) -> Pri
 async def score_listings(
     structured_listings: list[StructuredListing],
     signals_by_id: dict[str, DescriptionSignals],
+    weights: ScoringWeights = DEFAULT_WEIGHTS,
 ) -> list[ScoredListing]:
     scored = []
     async with async_playwright() as playwright:
@@ -62,7 +63,7 @@ async def score_listings(
             for listing in structured_listings:
                 baseline = await _resolve_baseline(listing, browser)
                 signals = signals_by_id.get(listing.listing_id)
-                scored.append(score_listing(listing, signals, baseline))
+                scored.append(score_listing(listing, signals, baseline, weights))
         finally:
             await browser.close()
     return scored

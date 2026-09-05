@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from becarscout.analyzer.models import DescriptionSignals
 from becarscout.pricing.models import PriceBaseline
-from becarscout.scoring.scoring import _condition_highlights, _price_component, score_listing
+from becarscout.scoring.models import ScoringWeights
+from becarscout.scoring.scoring import _condition_component, _condition_highlights, _price_component, score_listing
 from becarscout.structurer.models import StructuredListing
 
 
@@ -108,3 +109,38 @@ def test_extraction_failure_does_not_trip_the_whole_vehicle_gate():
     signals = _signals(extraction_failed=True)
     scored = score_listing(_structured(price_eur=4000), signals, baseline)
     assert scored.score != 0
+
+
+# --- ScoringWeights actually changes behavior (this is the whole point of
+# moving off hardcoded constants -- /validate needs this to be real) ---
+
+
+def test_custom_weights_change_the_condition_component():
+    signals = _signals(warning_light=True, needs_diagnostic=True, confidence="high")
+    default_component, _ = _condition_component(signals)
+
+    harsher = ScoringWeights(warning_light_needs_diagnostic=-50)
+    harsher_component, harsher_reasoning = _condition_component(signals, harsher)
+
+    assert harsher_component != default_component
+    assert harsher_component < default_component  # more negative
+    assert any("-50" in r for r in harsher_reasoning)
+
+
+def test_default_weights_reproduce_original_hardcoded_values():
+    # ScoringWeights() with no arguments must be behaviorally identical to
+    # the pre-refactor hardcoded constants -- this is the safety property
+    # the whole refactor depends on.
+    signals = _signals(gearbox_issue=True, gearbox_issue_severity="likely_major", confidence="high")
+    component, reasoning = _condition_component(signals, ScoringWeights())
+    assert any("-40" in r for r in reasoning)
+
+
+def test_score_listing_accepts_custom_weights_end_to_end():
+    baseline = PriceBaseline(make="Volkswagen", model="Golf", median_price_eur=9000, sample_size=5, confidence="high")
+    signals = _signals(for_export=True, confidence="high")
+
+    default_scored = score_listing(_structured(price_eur=8000), signals, baseline)
+    custom_scored = score_listing(_structured(price_eur=8000), signals, baseline, ScoringWeights(for_export=-60))
+
+    assert custom_scored.score < default_scored.score

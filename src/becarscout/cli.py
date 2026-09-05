@@ -12,6 +12,7 @@ from .feedback_agent import run_feedback_review
 from .notifier import find_chat_ids, run_feedback_listener, send_new_opportunities
 from .scoring import DEFAULT_MIN_YEAR, DEFAULT_THRESHOLD, apply_decision_gate, score_listings
 from .scraper import launch_login_browser, scrape_belgium_cars
+from .settings import PipelineSettings
 from .structurer import structure_listings
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,8 @@ async def do_score(*, threshold: int = DEFAULT_THRESHOLD, min_year: int | None =
             return 0, 0
         structured_listings = [s for s, _ in pending]
         signals_by_id = {s.listing_id: sig for s, sig in pending if sig is not None}
-        scored = await score_listings(structured_listings, signals_by_id)
+        weights = repo.get_scoring_weights(session)
+        scored = await score_listings(structured_listings, signals_by_id, weights)
         scored = apply_decision_gate(scored, threshold=threshold, min_year=min_year)
         repo.save_scores(session, scored)
         opportunities = sum(1 for s in scored if s.above_threshold)
@@ -175,16 +177,30 @@ async def run_full_pipeline(
 # ---- CLI glue ----
 
 
+def _current_settings() -> PipelineSettings:
+    """What `becarscout run`/`scrape`/`score` fall back to for any
+    parameter not explicitly given on the command line — this is what
+    lets `/budget`, `/minyear`, `/threshold`, `/radius` (Telegram) change
+    the *next* hourly cron run's behavior without a redeploy, since cron
+    always invokes `becarscout run` with zero flags."""
+    session = get_session()
+    try:
+        return repo.get_pipeline_settings(session)
+    finally:
+        session.close()
+
+
 def _cmd_login(_args: argparse.Namespace) -> None:
     asyncio.run(launch_login_browser())
 
 
 def _cmd_scrape(args: argparse.Namespace) -> None:
+    settings = _current_settings()
     new_count, price_changed_count = asyncio.run(
         do_scrape(
-            radius_km=args.radius_km,
-            min_price=args.min_price,
-            max_price=args.max_price,
+            radius_km=args.radius_km if args.radius_km is not None else settings.radius_km,
+            min_price=args.min_price if args.min_price is not None else settings.min_price,
+            max_price=args.max_price if args.max_price is not None else settings.max_price,
             max_scrolls=args.max_scrolls,
             fetch_details=not args.no_details,
             headless=not args.headed,
@@ -204,10 +220,12 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
 
 
 def _cmd_score(args: argparse.Namespace) -> None:
-    min_year = None if args.no_min_year else args.min_year
-    count, opportunities = asyncio.run(do_score(threshold=args.threshold, min_year=min_year))
+    settings = _current_settings()
+    min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
+    threshold = args.threshold if args.threshold is not None else settings.threshold
+    count, opportunities = asyncio.run(do_score(threshold=threshold, min_year=min_year))
     year_note = f", newer than {min_year}" if min_year is not None else ""
-    print(f"Scored {count} listings ({opportunities} above threshold {args.threshold}{year_note})")
+    print(f"Scored {count} listings ({opportunities} above threshold {threshold}{year_note})")
 
 
 def _cmd_notify(_args: argparse.Namespace) -> None:
@@ -262,16 +280,21 @@ def _cmd_whoami(_args: argparse.Namespace) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
-    min_year = None if args.no_min_year else args.min_year
+    # cron invokes this with zero flags every time, so this is the one
+    # place where the Telegram-set settings (/budget, /minyear,
+    # /threshold, /radius) actually take effect hour to hour — an
+    # explicit CLI flag still wins if one is given.
+    settings = _current_settings()
+    min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
     asyncio.run(
         run_full_pipeline(
-            radius_km=args.radius_km,
-            min_price=args.min_price,
-            max_price=args.max_price,
+            radius_km=args.radius_km if args.radius_km is not None else settings.radius_km,
+            min_price=args.min_price if args.min_price is not None else settings.min_price,
+            max_price=args.max_price if args.max_price is not None else settings.max_price,
             max_scrolls=args.max_scrolls,
             model=args.model,
             delay=args.delay,
-            threshold=args.threshold,
+            threshold=args.threshold if args.threshold is not None else settings.threshold,
             min_year=min_year,
             headless=not args.headed,
         )
@@ -293,9 +316,9 @@ def main() -> None:
     login_parser.set_defaults(func=_cmd_login)
 
     scrape_parser = subparsers.add_parser("scrape", help="Scrape car listings across Belgium into the database")
-    scrape_parser.add_argument("--radius-km", type=int, default=100)
-    scrape_parser.add_argument("--min-price", type=int, default=None)
-    scrape_parser.add_argument("--max-price", type=int, default=None)
+    scrape_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting (100 if never changed)")
+    scrape_parser.add_argument("--min-price", type=int, default=None, help="Default: current /budget setting")
+    scrape_parser.add_argument("--max-price", type=int, default=None, help="Default: current /budget setting")
     scrape_parser.add_argument("--max-scrolls", type=int, default=8)
     scrape_parser.add_argument(
         "--no-details", action="store_true",
@@ -322,8 +345,8 @@ def main() -> None:
     score_parser = subparsers.add_parser(
         "score", help="Score newly-analyzed listings (stages 4-5)"
     )
-    score_parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD, help=f"Decision gate score threshold (default {DEFAULT_THRESHOLD})")
-    score_parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Exclude cars from this year or older, even if they'd score above threshold (default {DEFAULT_MIN_YEAR})")
+    score_parser.add_argument("--threshold", type=int, default=None, help=f"Default: current /threshold setting ({DEFAULT_THRESHOLD} if never changed)")
+    score_parser.add_argument("--min-year", type=int, default=None, help=f"Default: current /minyear setting ({DEFAULT_MIN_YEAR} if never changed)")
     score_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
     score_parser.set_defaults(func=_cmd_score)
 
@@ -357,14 +380,14 @@ def main() -> None:
     run_parser = subparsers.add_parser(
         "run", help="Run the full pipeline once: scrape, structure, analyze, score, notify — meant for cron"
     )
-    run_parser.add_argument("--radius-km", type=int, default=100)
-    run_parser.add_argument("--min-price", type=int, default=None)
-    run_parser.add_argument("--max-price", type=int, default=None)
+    run_parser.add_argument("--radius-km", type=int, default=None, help="Default: current /radius setting")
+    run_parser.add_argument("--min-price", type=int, default=None, help="Default: current /budget setting")
+    run_parser.add_argument("--max-price", type=int, default=None, help="Default: current /budget setting")
     run_parser.add_argument("--max-scrolls", type=int, default=8)
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--delay", type=float, default=1.0)
-    run_parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
-    run_parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Exclude cars from this year or older (default {DEFAULT_MIN_YEAR})")
+    run_parser.add_argument("--threshold", type=int, default=None, help="Default: current /threshold setting")
+    run_parser.add_argument("--min-year", type=int, default=None, help="Default: current /minyear setting")
     run_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
     run_parser.add_argument("--headed", action="store_true")
     run_parser.set_defaults(func=_cmd_run)

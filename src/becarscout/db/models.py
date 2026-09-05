@@ -71,3 +71,56 @@ class ListingRow(Base):
 
     # Stage 6: Telegram delivery
     notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PipelineSettingsRow(Base):
+    """Singleton row (always id=1) holding the scrape/gate parameters you
+    can change live via Telegram commands (`/budget`, `/minyear`,
+    `/threshold`, `/radius`, `/settings`) instead of only via CLI flags or
+    a code change — `becarscout run` (what cron actually invokes) reads
+    this at the start of every run. A brand-new table is picked up
+    automatically by `Base.metadata.create_all` even on an
+    already-deployed DB (unlike a new *column* on an existing table,
+    which needs `db/engine.py`'s `_ensure_column` workaround)."""
+
+    __tablename__ = "pipeline_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    radius_km: Mapped[int] = mapped_column(Integer, default=100)
+    min_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    min_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    threshold: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ScoringWeightsRow(Base):
+    """Singleton row (always id=1) holding the condition-signal point
+    weights `scoring.py` used to only have as hardcoded module constants.
+    Moved here so `/validate` (see `feedback_agent/`) can actually apply a
+    feedback-derived weight suggestion at runtime, not just print it in a
+    report for you to hand-edit `scoring.py` and redeploy. Every column
+    defaults to exactly what the original hardcoded constant was —
+    nothing changes in scoring behavior until a row is explicitly written
+    here."""
+
+    __tablename__ = "scoring_weights"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    gearbox_issue_likely_major: Mapped[int] = mapped_column(Integer, default=-40)
+    gearbox_issue_minor: Mapped[int] = mapped_column(Integer, default=-20)
+    gearbox_issue_unknown: Mapped[int] = mapped_column(Integer, default=-20)
+    engine_issue_likely_major: Mapped[int] = mapped_column(Integer, default=-40)
+    engine_issue_minor: Mapped[int] = mapped_column(Integer, default=-20)
+    engine_issue_unknown: Mapped[int] = mapped_column(Integer, default=-20)
+    accident_damage: Mapped[int] = mapped_column(Integer, default=-25)
+    warning_light_needs_diagnostic: Mapped[int] = mapped_column(Integer, default=-20)
+    warning_light_only: Mapped[int] = mapped_column(Integer, default=-8)
+    timing_belt_replaced: Mapped[int] = mapped_column(Integer, default=12)
+    inspection_valid: Mapped[int] = mapped_column(Integer, default=6)
+    inspection_invalid: Mapped[int] = mapped_column(Integer, default=-18)
+    service_history_complete: Mapped[int] = mapped_column(Integer, default=6)
+    service_history_none: Mapped[int] = mapped_column(Integer, default=-6)
+    for_export: Mapped[int] = mapped_column(Integer, default=-15)
+    min_plausible_car_price_eur: Mapped[int] = mapped_column(Integer, default=300)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

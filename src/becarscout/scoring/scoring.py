@@ -3,6 +3,14 @@ gap (listing price vs. `PriceBaseline` comps median) with condition
 adjustments from stage 3's `DescriptionSignals`, each weighted by how much
 that part of the score should be trusted (baseline sample size, signals
 extraction confidence). Every point is named in the reasoning trail.
+
+Condition-signal weights are a `ScoringWeights` parameter (see
+`models.py`), not hardcoded constants — this is what lets `/validate`
+(see `feedback_agent/`) actually change scoring behavior at runtime from
+an approved feedback suggestion. Every function defaults to
+`DEFAULT_WEIGHTS`, which reproduces the original hardcoded values exactly,
+so nothing here changes behavior unless a caller explicitly passes a
+different `ScoringWeights`.
 """
 
 from __future__ import annotations
@@ -11,7 +19,7 @@ from becarscout.analyzer.models import DescriptionSignals
 from becarscout.pricing.models import PriceBaseline
 from becarscout.structurer.models import StructuredListing
 
-from .models import ScoredListing
+from .models import DEFAULT_WEIGHTS, ScoredListing, ScoringWeights
 
 # Applied to the price-gap component, based on how many comps the baseline
 # median was computed from (see pricing/baseline.py).
@@ -21,41 +29,20 @@ _BASELINE_CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.6, "low": 0.3, "none": 0
 # confidence in how clear/complete the description was to extract from.
 _SIGNALS_CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.7, "low": 0.4}
 
-# Point deltas per condition flag — the only place "what matters and how
-# much" is decided, so tuning the model's behavior means editing numbers
-# here, not hunting through scoring logic.
-_GEARBOX_ISSUE = {"likely_major": -40, "minor": -20, "unknown": -20}
-_ENGINE_ISSUE = {"likely_major": -40, "minor": -20, "unknown": -20}
-_ACCIDENT_DAMAGE = -25
-_WARNING_LIGHT_NEEDS_DIAGNOSTIC = -20
-_WARNING_LIGHT_ONLY = -8
-_TIMING_BELT_REPLACED = 12
-_INSPECTION_VALID = 6
-_INSPECTION_INVALID = -18
-_SERVICE_HISTORY_COMPLETE = 6
-_SERVICE_HISTORY_NONE = -6
-_FOR_EXPORT = -15
 
-# A genuine whole running car essentially never sells for less than this in
-# Belgium, even rough condition — prices below it are "make an offer" bait
-# pricing (seen as literal €0/€1 listings during MVP validation) or a
-# parts-only listing, neither of which is comparable to whole-car baseline
-# comps. Scored as "no reliable price" rather than as a 100%-below-market
-# steal.
-_MIN_PLAUSIBLE_CAR_PRICE_EUR = 300
-
-
-def _price_component(price_eur: int | None, baseline: PriceBaseline) -> tuple[float, list[str]]:
+def _price_component(
+    price_eur: int | None, baseline: PriceBaseline, weights: ScoringWeights = DEFAULT_WEIGHTS
+) -> tuple[float, list[str]]:
     if price_eur is None or baseline.median_price_eur is None:
         return 0.0, [
             f"No price baseline available for {baseline.make} {baseline.model} "
             "(no comparable listings found) — score based on condition signals only."
         ]
 
-    if price_eur <= _MIN_PLAUSIBLE_CAR_PRICE_EUR:
+    if price_eur <= weights.min_plausible_car_price_eur:
         return 0.0, [
             f"Price €{price_eur} is below a plausible whole-car threshold "
-            f"(€{_MIN_PLAUSIBLE_CAR_PRICE_EUR}) — likely a parts listing or "
+            f"(€{weights.min_plausible_car_price_eur}) — likely a parts listing or "
             "\"make an offer\" placeholder, not comparable to whole-car "
             "baseline comps. Price-gap not scored."
         ]
@@ -80,60 +67,73 @@ def _price_component(price_eur: int | None, baseline: PriceBaseline) -> tuple[fl
     return weighted, reasoning
 
 
-def _condition_component(signals: DescriptionSignals | None) -> tuple[float, list[str]]:
+def _condition_component(
+    signals: DescriptionSignals | None, weights: ScoringWeights = DEFAULT_WEIGHTS
+) -> tuple[float, list[str]]:
     if signals is None:
         return 0.0, ["No description signals available — condition unscored."]
     if signals.extraction_failed:
         return 0.0, ["Description analysis failed — condition unscored."]
+
+    gearbox_weights = {
+        "likely_major": weights.gearbox_issue_likely_major,
+        "minor": weights.gearbox_issue_minor,
+        "unknown": weights.gearbox_issue_unknown,
+    }
+    engine_weights = {
+        "likely_major": weights.engine_issue_likely_major,
+        "minor": weights.engine_issue_minor,
+        "unknown": weights.engine_issue_unknown,
+    }
 
     raw = 0
     reasoning: list[str] = []
 
     if signals.gearbox_issue:
         severity = signals.gearbox_issue_severity or "unknown"
-        delta = _GEARBOX_ISSUE.get(severity, _GEARBOX_ISSUE["unknown"])
+        delta = gearbox_weights.get(severity, gearbox_weights["unknown"])
         raw += delta
         reasoning.append(f"Gearbox issue ({severity}): {delta:+d}")
 
     if signals.engine_issue:
         severity = signals.engine_issue_severity or "unknown"
-        delta = _ENGINE_ISSUE.get(severity, _ENGINE_ISSUE["unknown"])
+        delta = engine_weights.get(severity, engine_weights["unknown"])
         raw += delta
         reasoning.append(f"Engine issue ({severity}): {delta:+d}")
 
     if signals.accident_damage:
-        raw += _ACCIDENT_DAMAGE
-        reasoning.append(f"Accident/body damage mentioned: {_ACCIDENT_DAMAGE:+d}")
+        raw += weights.accident_damage
+        reasoning.append(f"Accident/body damage mentioned: {weights.accident_damage:+d}")
 
     if signals.warning_light:
         if signals.needs_diagnostic:
-            raw += _WARNING_LIGHT_NEEDS_DIAGNOSTIC
-            reasoning.append(f"Warning light, needs diagnostic: {_WARNING_LIGHT_NEEDS_DIAGNOSTIC:+d}")
+            raw += weights.warning_light_needs_diagnostic
+            reasoning.append(f"Warning light, needs diagnostic: {weights.warning_light_needs_diagnostic:+d}")
         else:
-            raw += _WARNING_LIGHT_ONLY
-            reasoning.append(f"Warning light mentioned: {_WARNING_LIGHT_ONLY:+d}")
+            raw += weights.warning_light_only
+            reasoning.append(f"Warning light mentioned: {weights.warning_light_only:+d}")
 
     if signals.timing_belt_replaced:
-        raw += _TIMING_BELT_REPLACED
-        reasoning.append(f"Timing belt replaced: {_TIMING_BELT_REPLACED:+d}")
+        raw += weights.timing_belt_replaced
+        reasoning.append(f"Timing belt replaced: {weights.timing_belt_replaced:+d}")
 
     if signals.inspection_valid is True:
-        raw += _INSPECTION_VALID
-        reasoning.append(f"Inspection (keuring) valid: {_INSPECTION_VALID:+d}")
+        raw += weights.inspection_valid
+        reasoning.append(f"Inspection (keuring) valid: {weights.inspection_valid:+d}")
     elif signals.inspection_valid is False:
-        raw += _INSPECTION_INVALID
-        reasoning.append(f"Inspection (keuring) not valid: {_INSPECTION_INVALID:+d}")
+        raw += weights.inspection_invalid
+        reasoning.append(f"Inspection (keuring) not valid: {weights.inspection_invalid:+d}")
 
     if signals.service_history == "complete":
-        raw += _SERVICE_HISTORY_COMPLETE
-        reasoning.append(f"Complete service history: {_SERVICE_HISTORY_COMPLETE:+d}")
+        raw += weights.service_history_complete
+        reasoning.append(f"Complete service history: {weights.service_history_complete:+d}")
     elif signals.service_history == "none":
-        raw += _SERVICE_HISTORY_NONE
-        reasoning.append(f"No service history: {_SERVICE_HISTORY_NONE:+d}")
+        raw += weights.service_history_none
+        reasoning.append(f"No service history: {weights.service_history_none:+d}")
 
     if signals.for_export:
-        raw += _FOR_EXPORT
-        reasoning.append(f"Listed for export: {_FOR_EXPORT:+d}")
+        raw += weights.for_export
+        reasoning.append(f"Listed for export: {weights.for_export:+d}")
 
     if not reasoning:
         return 0.0, ["No notable condition signals found in description."]
@@ -149,7 +149,9 @@ def _condition_highlights(signals: DescriptionSignals | None) -> list[str]:
     `_condition_component` scores — this is what the Telegram card shows
     by default (see `notifier/formatting.py`); the point-by-point
     breakdown above is reserved for the on-demand "Why?" explanation, so
-    the default card reads like a person describing the car, not a ledger."""
+    the default card reads like a person describing the car, not a ledger.
+    Wording doesn't depend on the point weight, so this doesn't take a
+    `weights` parameter."""
     if signals is None or signals.extraction_failed:
         return []
 
@@ -216,10 +218,11 @@ def score_listing(
     structured: StructuredListing,
     signals: DescriptionSignals | None,
     baseline: PriceBaseline,
+    weights: ScoringWeights = DEFAULT_WEIGHTS,
 ) -> ScoredListing:
     # A real bug found via live Telegram output: a listing titled "2006
     # Subaru outback" was actually someone selling seats pulled from one,
-    # priced at exactly the €300 floor (see _MIN_PLAUSIBLE_CAR_PRICE_EUR,
+    # priced at exactly the €300 floor (see min_plausible_car_price_eur,
     # which only guards price — this guards content). Nothing about the
     # title alone flagged it; only stage 3 reading the description can.
     if signals is not None and not signals.extraction_failed and not signals.is_whole_vehicle:
@@ -235,8 +238,8 @@ def score_listing(
             ],
         )
 
-    price_component, price_reasoning = _price_component(structured.price_eur, baseline)
-    condition_component, condition_reasoning = _condition_component(signals)
+    price_component, price_reasoning = _price_component(structured.price_eur, baseline, weights)
+    condition_component, condition_reasoning = _condition_component(signals, weights)
 
     return ScoredListing(
         **_base_listing_fields(structured, baseline),

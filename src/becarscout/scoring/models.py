@@ -38,3 +38,33 @@ class ScoredListing(BaseModel):
     above_threshold: bool = False
 
     reasoning: list[str] = Field(default_factory=list)
+
+
+class ScoringWeights(BaseModel):
+    """The condition-signal point weights `scoring.py` applies — used to
+    be hardcoded module constants; moved into a plain, DB-backable model
+    so `/validate` (see `feedback_agent/`) can actually change scoring
+    behavior at runtime from an approved feedback suggestion, not just
+    print one in a report for manual hand-editing. Every default here is
+    exactly what the original hardcoded constant was — constructing this
+    with no arguments reproduces the original, un-tuned behavior."""
+
+    gearbox_issue_likely_major: int = -40
+    gearbox_issue_minor: int = -20
+    gearbox_issue_unknown: int = -20
+    engine_issue_likely_major: int = -40
+    engine_issue_minor: int = -20
+    engine_issue_unknown: int = -20
+    accident_damage: int = -25
+    warning_light_needs_diagnostic: int = -20
+    warning_light_only: int = -8
+    timing_belt_replaced: int = 12
+    inspection_valid: int = 6
+    inspection_invalid: int = -18
+    service_history_complete: int = 6
+    service_history_none: int = -6
+    for_export: int = -15
+    min_plausible_car_price_eur: int = 300
+
+
+DEFAULT_WEIGHTS = ScoringWeights()
