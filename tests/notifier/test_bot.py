@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from becarscout.db.models import ListingRow
-from becarscout.notifier.bot import _SUMMARY_LINE_RE, _budget_text, _format_search_hit, _parse_int_arg
+from becarscout.notifier.bot import _budget_text, _format_search_hit, _parse_int_arg, _summarize_find_output
 from becarscout.settings import PipelineSettings
 
 
@@ -62,13 +62,34 @@ def test_format_search_hit_marks_unscored_listings():
     assert "Not yet scored" in text
 
 
-def test_summary_line_regex_matches_pipeline_stage_lines():
-    assert _SUMMARY_LINE_RE.search("score: 31 listings (0 opportunities)")
-    assert _SUMMARY_LINE_RE.search("notify: 0 sent")
-    assert not _SUMMARY_LINE_RE.search("some unrelated log line")
+def test_summarize_find_output_reports_new_listings_and_sent_opportunities():
+    output = (
+        "2026-09-05 19:04:44 INFO scrape: 20 new listings, 3 price changes\n"
+        "2026-09-05 19:05:00 INFO score: 20 listings (2 opportunities)\n"
+        "2026-09-05 19:05:01 INFO notify: 2 sent\n"
+    )
+    text = _summarize_find_output(output)
+    assert "20 new listing" in text
+    assert "2" in text and "sent" in text.lower()
 
 
-def test_summary_line_regex_strips_timestamp_and_level_prefix():
-    match = _SUMMARY_LINE_RE.search("2026-09-05 19:04:44,550 INFO score: 31 listings (0 opportunities)")
-    assert match is not None
-    assert match.group(0) == "score: 31 listings (0 opportunities)"
+def test_summarize_find_output_when_nothing_cleared_the_bar():
+    output = (
+        "2026-09-05 19:04:44 INFO scrape: 5 new listings, 0 price changes\n"
+        "2026-09-05 19:05:00 INFO score: 5 listings (0 opportunities)\n"
+        "2026-09-05 19:05:01 INFO notify: 0 sent\n"
+    )
+    text = _summarize_find_output(output)
+    assert "5 new listing" in text
+    assert "Nothing good enough" in text
+
+
+def test_summarize_find_output_handles_singular_listing():
+    output = "2026-09-05 19:04:44 INFO scrape: 1 new listings, 0 price changes\n"
+    text = _summarize_find_output(output)
+    assert "1 new listing." in text
+
+
+def test_summarize_find_output_falls_back_when_nothing_recognizable():
+    text = _summarize_find_output("some unrelated crash traceback")
+    assert "went wrong" in text

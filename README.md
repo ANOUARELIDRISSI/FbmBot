@@ -111,8 +111,11 @@ Once `becarscout listen` is running (it's always running in Docker), these comma
 straight from the chat — no SSH, no redeploy. Typing `/` in the chat shows all of them as
 autocomplete suggestions with a short description (registered via `setMyCommands` on
 startup — see `_post_init` in `notifier/bot.py`), so you don't need to remember the exact
-names.
+names. All bot replies use plain, non-technical language on purpose (no "scrape"/"score"
+pipeline jargon) — anyone can use this without knowing how it works internally.
 
+- `/start` or `/help` — a plain-language welcome message explaining what the bot does and
+  how to set it up. Send this first if you're new.
 - `/find` — runs the full pipeline right now (scrape → structure → analyze → score →
   notify) instead of waiting for the next hourly cron tick. Replies immediately, then
   messages again with a summary once the run finishes (can take a few minutes).
