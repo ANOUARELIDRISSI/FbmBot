@@ -60,6 +60,39 @@ def format_score_explanation(listing: ScoredListing) -> str:
     return "\n".join(lines)
 
 
+_MAX_HISTORY_ROWS = 30
+"""Telegram caps a message at 4096 characters -- past this many rows the
+summary gets capped and says how many more there were, rather than risk a
+send failure on a long history."""
+
+
+def format_history_summary(entries: list[tuple[ScoredListing, str | None]], days: int) -> str:
+    """Backs `/history [days]` — a compact, scannable list (title, score,
+    price, reviewed/not) of everything sent in the requested window, not
+    just whatever's still visible in the chat. `entries` is
+    (listing, feedback_verdict) pairs, most recent first — see
+    `db/repository.get_opportunities_in_range`."""
+    period = f"{days} day{'s' if days != 1 else ''}"
+    if not entries:
+        return f"No opportunities sent in the last {period}."
+
+    lines = [f"*Opportunities from the last {period}* ({len(entries)}):", ""]
+    for listing, verdict in entries[:_MAX_HISTORY_ROWS]:
+        mark = "\U0001f44d" if verdict == "up" else "\U0001f44e" if verdict == "down" else "—"
+        price = f"€{listing.price_eur:,}" if listing.price_eur is not None else "?"
+        lines.append(f"{mark} {listing.score:+d} · {_escape(listing.raw_title)} · {price}")
+
+    if len(entries) > _MAX_HISTORY_ROWS:
+        lines.append(f"...and {len(entries) - _MAX_HISTORY_ROWS} more.")
+
+    unreviewed = sum(1 for _, verdict in entries if verdict is None)
+    if unreviewed:
+        lines.append("")
+        lines.append(f"{unreviewed} not yet reviewed — send /missed to go through them.")
+
+    return "\n".join(lines)
+
+
 def _similar_feedback_note(similar_feedback: list[dict]) -> str:
     """Stage 7's memory context, surfaced as a plain note — never changes
     the score above, just gives you more to go on before you tap

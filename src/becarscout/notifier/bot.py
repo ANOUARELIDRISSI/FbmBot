@@ -11,10 +11,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
 from becarscout.db import get_session
@@ -23,7 +24,7 @@ from becarscout.feedback_agent.memory import find_similar_feedback, store_feedba
 from becarscout.scoring.models import ScoredListing
 
 from .feedback import record_feedback
-from .formatting import format_opportunity_message, format_score_explanation
+from .formatting import format_history_summary, format_opportunity_message, format_score_explanation
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,11 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
         return
 
     record_feedback(listing_id, verdict)
+    session = get_session()
+    try:
+        repo.mark_feedback(session, listing_id, verdict)
+    finally:
+        session.close()
     scored = _fetch_scored_listing(listing_id)
     if scored is not None:
         store_feedback_memory(scored, verdict)
@@ -173,14 +179,95 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
         logger.exception("Failed to acknowledge feedback for %s", listing_id)
 
 
+def _parse_days_arg(args: list[str] | None, default: int | None) -> int | None:
+    if not args:
+        return default
+    try:
+        return max(1, int(args[0]))
+    except ValueError:
+        return default
+
+
+async def _cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/history [days]` — browse past opportunities by date range instead
+    of only ever seeing what's still visible in the chat (default: last 7
+    days). Read-only: just a summary line per listing, no buttons."""
+    if not update.effective_chat:
+        return
+    days = _parse_days_arg(context.args, default=7)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    session = get_session()
+    try:
+        entries = repo.get_opportunities_in_range(session, start, end)
+    finally:
+        session.close()
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=format_history_summary(entries, days),
+        parse_mode="Markdown",
+    )
+
+
+_MAX_MISSED_RESENDS = 20
+"""Each unreviewed opportunity is a full card -- resending more than this
+in one go floods the chat; narrow with /missed <days> instead."""
+
+
+async def _cmd_missed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/missed [days]` — resends opportunities that were never reviewed
+    (no 👍/👎 yet), *with* their buttons, so a busy day that buried a card
+    under newer ones doesn't mean it's unreachable. No `days` argument
+    means "everything still unreviewed," regardless of age."""
+    if not update.effective_chat:
+        return
+    days = _parse_days_arg(context.args, default=None)
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days is not None else None
+
+    session = get_session()
+    try:
+        unreviewed = repo.get_unreviewed_opportunities(session, since=since)
+    finally:
+        session.close()
+
+    if not unreviewed:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Nothing waiting on your review.")
+        return
+
+    to_send = unreviewed[:_MAX_MISSED_RESENDS]
+    for listing in to_send:
+        similar_feedback = find_similar_feedback(listing)
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_opportunity_message(listing, similar_feedback),
+                parse_mode="Markdown",
+                reply_markup=_keyboard(listing.listing_id),
+            )
+        except Exception:
+            logger.exception("Failed to resend missed opportunity %s", listing.listing_id)
+
+    if len(unreviewed) > _MAX_MISSED_RESENDS:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Showing {_MAX_MISSED_RESENDS} of {len(unreviewed)} unreviewed — "
+            "narrow with /missed <days> to see fewer at a time.",
+        )
+
+
 def run_feedback_listener() -> None:
-    """Blocks, polling for 👍/👎 button presses until interrupted (Ctrl+C).
-    Run this as a standing background process — `becarscout notify` only
-    sends messages, it doesn't listen for the replies."""
+    """Blocks, polling for 👍/👎 button presses (and /history, /missed
+    commands) until interrupted (Ctrl+C). Run this as a standing
+    background process — `becarscout notify` only sends messages, it
+    doesn't listen for replies or commands."""
     token, _ = _get_credentials()
     application = ApplicationBuilder().token(token).build()
     application.add_handler(
         CallbackQueryHandler(_handle_feedback_callback, pattern=rf"^{CALLBACK_PREFIX}:")
     )
-    logger.info("Listening for feedback button presses... (Ctrl+C to stop)")
+    application.add_handler(CommandHandler("history", _cmd_history))
+    application.add_handler(CommandHandler("missed", _cmd_missed))
+    logger.info("Listening for feedback button presses and commands... (Ctrl+C to stop)")
     application.run_polling()

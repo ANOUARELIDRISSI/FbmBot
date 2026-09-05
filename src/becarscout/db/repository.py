@@ -246,3 +246,56 @@ def mark_notified(session: Session, listing_ids: list[str]) -> None:
         if row is not None:
             row.notified_at = _now()
     session.commit()
+
+
+def mark_feedback(session: Session, listing_id: str, verdict: str) -> None:
+    """Stamps the DB row with the same verdict `feedback.jsonl` and mem0
+    already get — this is what lets `/history` and `/missed` (see
+    `notifier/bot.py`) tell reviewed from unreviewed opportunities
+    without cross-referencing a separate file."""
+    row = session.get(ListingRow, listing_id)
+    if row is not None:
+        row.feedback_verdict = verdict
+        session.commit()
+
+
+def get_opportunities_in_range(
+    session: Session, start: datetime, end: datetime
+) -> list[tuple[ScoredListing, str | None]]:
+    """Every opportunity notified within [start, end), most recent first
+    — backs `/history <days>` so you can browse past sends by date range
+    instead of only ever seeing what's freshly pushed."""
+    rows = (
+        session.execute(
+            select(ListingRow)
+            .where(
+                ListingRow.above_threshold.is_(True),
+                ListingRow.notified_at.is_not(None),
+                ListingRow.notified_at >= start,
+                ListingRow.notified_at < end,
+            )
+            .order_by(ListingRow.notified_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [(_row_to_scored(row), row.feedback_verdict) for row in rows]
+
+
+def get_unreviewed_opportunities(session: Session, since: datetime | None = None) -> list[ScoredListing]:
+    """Opportunities already sent to Telegram that never got a
+    thumbs-up/down — backs `/missed`, which resends them *with* buttons
+    so they stay actionable instead of just scrolled past."""
+    conditions = [
+        ListingRow.above_threshold.is_(True),
+        ListingRow.notified_at.is_not(None),
+        ListingRow.feedback_verdict.is_(None),
+    ]
+    if since is not None:
+        conditions.append(ListingRow.notified_at >= since)
+    rows = (
+        session.execute(select(ListingRow).where(*conditions).order_by(ListingRow.notified_at.desc()))
+        .scalars()
+        .all()
+    )
+    return [_row_to_scored(row) for row in rows]

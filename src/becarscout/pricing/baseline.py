@@ -1,6 +1,15 @@
 """Turns a pool of `Comp`s into a `PriceBaseline` for one target listing.
-Deterministic median-based comps analysis — no LLM, no regression (not
-enough volume yet for one; see Project.md stage 4 notes).
+Deterministic median-based comps analysis — no LLM, no black-box ML model
+(see Project.md's design principle: every score traces back to an
+explainable number, never an opaque model's output). Two statistically-
+grounded techniques were added after researching what a proper
+pricing/anomaly-detection pipeline would actually use (see Project.md's
+comps-matching hardening notes): a robust outlier detector (median
+absolute deviation, not a fixed ratio) and empirical-Bayes-style shrinkage
+of a thin local comps pool toward a broader market prior. Both are simple,
+well-established formulas — not opaque models — so the reasoning trail
+stays fully auditable; a full ML anomaly ensemble (e.g. Isolation Forest)
+was considered and rejected for this reason, not for lack of accuracy.
 """
 
 from __future__ import annotations
@@ -25,14 +34,31 @@ _MILEAGE_FRACTION_WIDE = 0.7
 _MIN_SAMPLE_FOR_TRIM = 5
 """Below this, don't trim outliers — there's nothing to spare."""
 
+_MAD_OUTLIER_THRESHOLD = 3.5
+"""A modified z-score (median-absolute-deviation based, not mean/stdev
+based) beyond this is the conventional threshold for "probable outlier"
+(Iglewicz & Hoaglin, 1993) — far less sensitive to the very outliers it's
+detecting than a plain z-score would be, since MAD itself isn't dragged
+around by extreme values the way standard deviation is. Needs at least 3
+points to compute a stable MAD; below that, `_MAX_PRICE_RATIO` below is
+the fallback guard (see `_trim_mad_outliers`)."""
+
 _MAX_PRICE_RATIO = 5.0
-"""If the matched comp pool's highest price is more than this many times
-its lowest, the pool almost certainly still mixes incompatible trims/
-generations even after year/mileage filtering (e.g. only 2-3 comps
-survived the year filter and one of them is a rare high-trim outlier) —
-the median from a pool like that isn't trustworthy. Outliers are trimmed
-toward this ratio before computing the median, and confidence is forced
-down if trimming still can't bring it under the threshold."""
+"""Fallback guard for pools too small (<3) to compute a stable MAD from:
+if the pool's highest price is still more than this many times its
+lowest, confidence is capped regardless of n (see `_confidence_for`)."""
+
+_SHRINKAGE_PRIOR_WEIGHT = 3
+"""Empirical-Bayes-style shrinkage constant: a thin local comps pool (few
+matches surviving year/mileage filtering) gets its median pulled toward a
+broader prior — this make/model's full comp pool, before that filtering —
+proportional to how little local evidence there is (n / (n + k) linear
+blending). At n=k local comps the estimate is a 50/50 blend; well above k,
+the prior's influence fades toward zero. Motivated by a real case: a 2006
+Subaru Outback matched only 2 comps after filtering, and their raw median
+was taken as gospel with nothing to check it against — shrinking a 2-comp
+estimate toward the wider Subaru Outback market is more honest than
+trusting 2 data points outright. See `_shrink_toward_prior`."""
 
 
 def _filter_by_year(comps: list[Comp], target_year: int, window: int) -> list[Comp]:
@@ -58,24 +84,49 @@ def _price_ratio(comps: list[Comp]) -> float:
     return max(prices) / min(prices)
 
 
-def _trim_to_price_ratio(comps: list[Comp], max_ratio: float) -> list[Comp]:
-    """Iteratively drops whichever extreme (lowest or highest price) is
-    farther from the median, until the pool's price ratio is within bounds
-    or there's nothing left worth trimming (2 comps)."""
-    remaining = sorted(comps, key=lambda c: c.price_eur)
-    while len(remaining) > 2 and _price_ratio(remaining) > max_ratio:
-        med = statistics.median(c.price_eur for c in remaining)
-        if (med - remaining[0].price_eur) >= (remaining[-1].price_eur - med):
-            remaining = remaining[1:]
-        else:
-            remaining = remaining[:-1]
-    return remaining
+def _modified_z_scores(prices: list[int]) -> list[float]:
+    """Iglewicz & Hoaglin's modified z-score: 0.6745 * (x - median) / MAD.
+    The 0.6745 constant scales MAD to be comparable to a standard
+    deviation under a normal distribution, so the same ~3.5 threshold
+    convention used for a plain z-score applies here too."""
+    med = statistics.median(prices)
+    mad = statistics.median([abs(p - med) for p in prices])
+    if mad == 0:
+        return [0.0] * len(prices)
+    return [0.6745 * (p - med) / mad for p in prices]
+
+
+def _trim_mad_outliers(comps: list[Comp], threshold: float = _MAD_OUTLIER_THRESHOLD) -> list[Comp]:
+    """Needs at least 3 points for a MAD estimate to mean anything — below
+    that, `compute_baseline` relies on `_confidence_for`'s simpler ratio
+    guard instead of trying to identify an "outlier" among 1-2 points."""
+    if len(comps) < 3:
+        return comps
+    prices = [c.price_eur for c in comps]
+    z_scores = _modified_z_scores(prices)
+    kept = [c for c, z in zip(comps, z_scores) if abs(z) <= threshold]
+    return kept if len(kept) >= 2 else comps  # never trim down to nothing
+
+
+def _shrink_toward_prior(local_comps: list[Comp], all_comps: list[Comp]) -> int:
+    """Blends the local (year/mileage-filtered, outlier-trimmed) median
+    toward the broader make/model prior when there's little local
+    evidence — see `_SHRINKAGE_PRIOR_WEIGHT`. A no-op once there's enough
+    local data (`_MIN_SAMPLE_FOR_TRIM` or more) to stand on its own."""
+    local_median = _median_price(local_comps)
+    n = len(local_comps)
+    if n >= _MIN_SAMPLE_FOR_TRIM or len(all_comps) < 2:
+        return local_median
+    prior_median = _median_price(all_comps)
+    weight = n / (n + _SHRINKAGE_PRIOR_WEIGHT)
+    return round(weight * local_median + (1 - weight) * prior_median)
 
 
 def _confidence_for(sample_size: int, price_ratio: float) -> str:
     if price_ratio > _MAX_PRICE_RATIO:
-        # Even after trimming, this pool spans too wide a price range to
-        # trust — cap confidence regardless of how many comps remain.
+        # Even after MAD trimming (or too few points to trim at all), this
+        # pool spans too wide a price range to trust — cap confidence
+        # regardless of how many comps remain.
         return "low" if sample_size >= 1 else "none"
     if sample_size >= 5:
         return "high"
@@ -125,14 +176,14 @@ def compute_baseline(
             make=make, model=model, target_year=target_year, target_mileage_km=target_mileage_km
         )
 
-    matched = _trim_to_price_ratio(matched, _MAX_PRICE_RATIO)
+    trimmed = _trim_mad_outliers(matched)
 
     return PriceBaseline(
         make=make,
         model=model,
         target_year=target_year,
         target_mileage_km=target_mileage_km,
-        median_price_eur=_median_price(matched),
-        sample_size=len(matched),
-        confidence=_confidence_for(len(matched), _price_ratio(matched)),
+        median_price_eur=_shrink_toward_prior(trimmed, comps),
+        sample_size=len(trimmed),
+        confidence=_confidence_for(len(trimmed), _price_ratio(trimmed)),
     )

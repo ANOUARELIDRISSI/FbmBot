@@ -7,7 +7,7 @@ market" deal signal.
 
 from __future__ import annotations
 
-from becarscout.pricing.baseline import compute_baseline
+from becarscout.pricing.baseline import _modified_z_scores, _shrink_toward_prior, compute_baseline
 from becarscout.pricing.models import Comp
 
 
@@ -78,3 +78,70 @@ def test_price_ratio_outlier_is_trimmed_before_computing_median():
     assert baseline.median_price_eur is not None
     assert baseline.median_price_eur < 15000
     assert baseline.confidence != "none"
+
+
+# --- MAD-based outlier detection (Iglewicz & Hoaglin modified z-score) ---
+
+
+def test_modified_z_score_flags_the_extreme_value():
+    z_scores = _modified_z_scores([9000, 9500, 10000, 60000])
+    assert abs(z_scores[-1]) > 3.5
+    assert all(abs(z) < 3.5 for z in z_scores[:-1])
+
+
+def test_modified_z_score_flags_nothing_in_a_tight_cluster():
+    z_scores = _modified_z_scores([9200, 9800, 10100, 10400, 10600, 11000])
+    assert all(abs(z) < 3.5 for z in z_scores)
+
+
+def test_mad_trimming_needs_at_least_three_points():
+    # Can't compute a stable MAD from 1-2 points -- compute_baseline falls
+    # back to the simpler ratio guard for those instead (see
+    # test_high_variance_pool_forces_confidence_down_even_with_only_two_comps).
+    comps = [_comp(price_eur=4800, year=2007), _comp(price_eur=32000, year=2008)]
+    baseline = compute_baseline("Dodge", "Nitro", comps, target_year=2007)
+    assert baseline.sample_size == 2  # nothing was (or could be) trimmed
+
+
+# --- Empirical-Bayes-style shrinkage toward a broader prior ---
+
+
+def test_shrinkage_pulls_a_thin_local_pool_toward_the_wider_market():
+    # The real case that motivated this: a 2006 Subaru Outback matched
+    # only 2 local comps (both far from the wider Outback market), and
+    # their raw median was trusted outright. Shrinkage should land
+    # somewhere between the two, not exactly on the thin local median.
+    local = [_comp(price_eur=15000), _comp(price_eur=16000)]  # local median 15500
+    all_comps = local + [_comp(price_eur=p) for p in (9000, 9200, 9500, 9800, 10000, 10200)]  # wider market ~9500
+
+    blended = _shrink_toward_prior(local, all_comps)
+
+    assert 9500 < blended < 15500
+
+
+def test_shrinkage_is_a_no_op_with_enough_local_evidence():
+    local = [_comp(price_eur=p) for p in (9000, 9500, 10000, 10200, 10500)]  # 5, meets the trim threshold
+    all_comps = local + [_comp(price_eur=20000)]
+
+    blended = _shrink_toward_prior(local, all_comps)
+
+    assert blended == 10000  # unaffected by the prior
+
+
+def test_shrinkage_falls_back_to_local_median_with_no_wider_pool():
+    local = [_comp(price_eur=15000)]
+    assert _shrink_toward_prior(local, all_comps=local) == 15000
+
+
+def test_thin_pool_baseline_lands_between_local_and_wider_market():
+    # End-to-end version of the shrinkage case above, through
+    # compute_baseline's public interface.
+    comps = [_comp(price_eur=p, year=2006) for p in (15000, 16000)] + [
+        _comp(price_eur=p, year=2010) for p in (9000, 9200, 9500, 9800, 10000, 10200)
+    ]
+
+    baseline = compute_baseline("Subaru", "Outback", comps, target_year=2006)
+
+    assert baseline.sample_size == 2
+    assert baseline.median_price_eur is not None
+    assert baseline.median_price_eur < 15500  # pulled down from the thin local median

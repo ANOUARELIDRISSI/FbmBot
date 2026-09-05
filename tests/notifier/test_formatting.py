@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from becarscout.notifier.formatting import format_opportunity_message, format_score_explanation
+from becarscout.notifier.formatting import (
+    format_history_summary,
+    format_opportunity_message,
+    format_score_explanation,
+)
 from becarscout.scoring.models import ScoredListing
 
 
@@ -79,3 +83,30 @@ def test_score_explanation_contains_the_full_reasoning_trail():
 def test_score_explanation_handles_no_reasoning():
     explanation = format_score_explanation(_listing(reasoning=[]))
     assert "No detailed reasoning available." in explanation
+
+
+def test_history_summary_handles_empty_range():
+    assert "No opportunities sent" in format_history_summary([], days=7)
+
+
+def test_history_summary_marks_reviewed_and_unreviewed():
+    entries = [
+        (_listing(listing_id="a"), "up"),
+        (_listing(listing_id="b"), "down"),
+        (_listing(listing_id="c"), None),
+    ]
+    summary = format_history_summary(entries, days=7)
+    assert "1 not yet reviewed" in summary
+    assert "/missed" in summary
+
+
+def test_history_summary_omits_the_unreviewed_line_when_all_reviewed():
+    entries = [(_listing(listing_id="a"), "up"), (_listing(listing_id="b"), "down")]
+    summary = format_history_summary(entries, days=7)
+    assert "not yet reviewed" not in summary
+
+
+def test_history_summary_caps_long_lists():
+    entries = [(_listing(listing_id=str(i)), "up") for i in range(50)]
+    summary = format_history_summary(entries, days=30)
+    assert "...and 20 more." in summary

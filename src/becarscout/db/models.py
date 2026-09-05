@@ -71,3 +71,8 @@ class ListingRow(Base):
 
     # Stage 6: Telegram delivery
     notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    feedback_verdict: Mapped[str | None] = mapped_column(String, nullable=True)
+    """'up'/'down' once you tap a button on the card, else None. Kept
+    alongside the flat feedback.jsonl audit trail and mem0's memory store
+    — this is what lets /history and /missed tell reviewed from
+    unreviewed opportunities without cross-referencing a separate file."""
