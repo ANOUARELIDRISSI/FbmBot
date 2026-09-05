@@ -26,6 +26,8 @@ from urllib.parse import urlencode
 import trafilatura
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from becarscout.structurer.parse import parse_price
+
 from .belgium import BELGIUM_HUBS, CATEGORY, DEFAULT_RADIUS_KM, Hub
 from .models import RawListing
 from .session import DEFAULT_PROFILE_DIR, has_saved_session
@@ -72,6 +74,21 @@ _NON_CAR_TITLE_KEYWORDS = (
 def _is_non_car_vehicle(title: str) -> bool:
     haystack = title.lower()
     return any(keyword in haystack for keyword in _NON_CAR_TITLE_KEYWORDS)
+
+
+def _prices_differ(old_price_text: str | None, new_price_text: str | None) -> bool:
+    """Compares *parsed* numeric prices, not raw text — a grid-vs-detail-
+    page formatting difference for the exact same price (e.g. "8.500" vs
+    "8 500") must never be mistaken for a real price change. Returns
+    False (no detectable change) rather than True when either side can't
+    be parsed at all, since a false "price changed" is worse than missing
+    a real one here — it would trigger an unnecessary detail-page revisit
+    and re-score."""
+    old_price, _ = parse_price(old_price_text)
+    new_price, _ = parse_price(new_price_text)
+    if old_price is None or new_price is None:
+        return False
+    return old_price != new_price
 
 
 def _search_url(hub: Hub, *, radius_km: int, min_price: int | None, max_price: int | None) -> str:
@@ -282,12 +299,35 @@ async def scrape_belgium_cars(
     fetch_details: bool = True,
     headless: bool = True,
     known_ids: frozenset[str] = frozenset(),
-) -> list[RawListing]:
-    """`known_ids` lets a caller (the DB-backed CLI) skip the expensive
+    known_price_texts: dict[str, str] | None = None,
+) -> tuple[list[RawListing], list[RawListing]]:
+    """Returns `(new_listings, price_changed_listings)`.
+
+    `known_ids` lets a caller (the DB-backed CLI) skip the expensive
     per-listing detail-page visit for listings it has already seen in a
     previous run — critical for hourly cron, since without this every run
     would re-visit every still-live listing's page even though only the
-    handful of genuinely new ones matter."""
+    handful of genuinely new ones matter.
+
+    `known_price_texts` (listing_id -> the price text stored for it) is
+    what makes a seller changing the price on an already-known listing
+    detectable at all: the grid pass exposes a price for every card,
+    known or not, so a mismatch there flags a *candidate* without needing
+    to revisit every known listing's detail page. That grid price is only
+    a rough heuristic though (see `fetch_listing_detail`'s docstring) —
+    live testing found it disagrees with the authoritative detail-page
+    price often enough on already-indexed listings to be unusable as
+    ground truth on its own (roughly 3 in 4 flagged "changes" turned out
+    to be the same price once confirmed). So a grid mismatch only
+    triggers a detail-page revisit; the actual change verdict comes from
+    comparing *that* authoritative price against what was stored,
+    discarding the candidate if it turns out unchanged. The same revisit
+    also refreshes the description and photos, catching an edited post,
+    not just a new price. A pure description-only edit with the price
+    genuinely unchanged isn't detectable this way; that would need
+    revisiting every known listing every run, which defeats the whole
+    point of `known_ids` — a documented limitation, not solved here."""
+    known_price_texts = known_price_texts or {}
     if not has_saved_session():
         raise RuntimeError(
             "No saved Facebook session found. Run `becarscout login` first."
@@ -314,17 +354,26 @@ async def scrape_belgium_cars(
             listings = list(all_listings.values())
             logger.info("Found %d unique listings across %d hubs", len(listings), len(hubs))
 
+            price_change_candidates: list[RawListing] = []
             if known_ids:
-                new_listings = [listing for listing in listings if listing.listing_id not in known_ids]
+                new_listings = []
+                for listing in listings:
+                    if listing.listing_id not in known_ids:
+                        new_listings.append(listing)
+                    elif _prices_differ(known_price_texts.get(listing.listing_id), listing.price_text):
+                        price_change_candidates.append(listing)
+                unchanged = len(listings) - len(new_listings) - len(price_change_candidates)
                 logger.info(
-                    "%d already known from a previous run, %d new", len(listings) - len(new_listings), len(new_listings)
+                    "%d already known and unchanged, %d new, %d price-change candidates (grid-level, unconfirmed)",
+                    unchanged, len(new_listings), len(price_change_candidates),
                 )
                 listings = new_listings
 
+            price_changed: list[RawListing] = []
             if fetch_details:
-                detailed = []
+                detailed_by_id: dict[str, RawListing] = {}
                 skipped = 0
-                for listing in listings:
+                for listing in listings + price_change_candidates:
                     try:
                         detail = await fetch_listing_detail(context, listing)
                     except Exception:
@@ -335,11 +384,32 @@ async def scrape_belgium_cars(
                         skipped += 1
                         logger.info("Skipping non-car listing: %r (%s)", detail.title, detail.url)
                         continue
-                    detailed.append(detail)
+                    detailed_by_id[detail.listing_id] = detail
 
-                logger.info("Kept %d cars, skipped %d non-car vehicles", len(detailed), skipped)
-                listings = detailed
+                logger.info("Kept %d cars, skipped %d non-car vehicles", len(detailed_by_id), skipped)
+                listings = [detailed_by_id[l.listing_id] for l in listings if l.listing_id in detailed_by_id]
 
-            return listings
+                # Confirm each candidate against the authoritative detail-
+                # page price rather than trusting the grid's rough guess —
+                # see the docstring above for why this step exists.
+                confirmed_unchanged = 0
+                for candidate in price_change_candidates:
+                    detail = detailed_by_id.get(candidate.listing_id)
+                    if detail is None:
+                        continue
+                    if _prices_differ(known_price_texts.get(candidate.listing_id), detail.price_text):
+                        price_changed.append(detail)
+                    else:
+                        confirmed_unchanged += 1
+                if price_change_candidates:
+                    logger.info(
+                        "%d price-change candidate(s) confirmed real, %d turned out unchanged once verified",
+                        len(price_changed), confirmed_unchanged,
+                    )
+            # else (fetch_details=False): candidates stay unconfirmed and
+            # are deliberately not reported — a grid-only "price changed"
+            # signal isn't reliable enough to act on by itself.
+
+            return listings, price_changed
         finally:
             await context.close()

@@ -14,8 +14,9 @@ Telegram → remember your feedback for next time. Runs hourly, unattended, in D
   mechanical/administrative signals a regex can't (warning lights, timing belt
   replacement, BTW/margin scheme, export intent, ...).
 - **Stage 4/5** (`src/becarscout/pricing/` + `src/becarscout/scoring/`) — price comps from
-  2dehands.be, combined with stage 3's signals into one auditable score + reasoning trail,
-  filtered by a threshold.
+  2dehands.be and 2ememain.be (same underlying marketplace, bilingual front-ends — not
+  independent sources, just broader coverage), combined with stage 3's signals into one
+  auditable score + reasoning trail, filtered by a score threshold and a minimum year.
 - **Stage 6** (`src/becarscout/notifier/`) — sends opportunity cards to Telegram with
   👍/👎 buttons; a separate standing process records button presses.
 - **Stage 7** (`src/becarscout/feedback_agent/`) — a local mem0 memory store remembers
@@ -72,11 +73,27 @@ uv run becarscout notify      # -> sends newly-scored opportunities to Telegram
 ```
 
 Each command only processes what the previous stage left behind since the last run —
-re-running `analyze` right after itself does nothing, for example. Useful `scrape` flags:
+re-running `analyze` right after itself does nothing, for example. `scrape` also detects
+when a known listing's price has changed (comparing parsed numbers, not raw text, so
+formatting differences don't cause false positives) and automatically re-scores/
+re-notifies it — a pure description edit with no price change isn't detectable this way
+(would need revisiting every known listing's page every run). Useful `scrape` flags:
 `--radius-km`, `--min-price`/`--max-price`, `--max-scrolls`, `--no-details` (skip detail
 pages, faster/less data), `--headed` (visible browser, for debugging selectors). `score`
-takes `--threshold` (default 20). `analyze` takes `--model` (default `ministral-8b-latest`)
-and `--delay` (seconds between API calls, default 1.0).
+takes `--threshold` (default 20) and `--min-year` (default 2010 — cars from that year or
+older never clear the gate regardless of score; `--no-min-year` disables it). `analyze`
+takes `--model` (default `ministral-8b-latest`) and `--delay` (seconds between API calls,
+default 1.0).
+
+```bash
+uv run becarscout rescore     # queue every scored listing for re-evaluation with current code
+```
+
+Incremental processing means a `scoring.py`/`baseline.py` fix only affects listings scored
+*after* it ships — anything already scored keeps its old value until something resets it.
+Run `rescore` then `score` (then `notify`) after a scoring-affecting fix to apply it
+retroactively; `notified_at` is left alone, so this won't cause already-sent opportunities
+to resend on their own.
 
 ```bash
 uv run becarscout listen      # standing process: records 👍/👎 button presses

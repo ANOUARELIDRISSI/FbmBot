@@ -10,7 +10,7 @@ from .db import get_session
 from .db import repository as repo
 from .feedback_agent import run_feedback_review
 from .notifier import find_chat_ids, run_feedback_listener, send_new_opportunities
-from .scoring import DEFAULT_THRESHOLD, apply_decision_gate, score_listings
+from .scoring import DEFAULT_MIN_YEAR, DEFAULT_THRESHOLD, apply_decision_gate, score_listings
 from .scraper import launch_login_browser, scrape_belgium_cars
 from .structurer import structure_listings
 
@@ -28,14 +28,16 @@ async def do_scrape(
     max_scrolls: int = 8,
     fetch_details: bool = True,
     headless: bool = True,
-) -> int:
+) -> tuple[int, int]:
+    """Returns (new_count, price_changed_count)."""
     session = get_session()
     try:
         known_ids = frozenset(repo.get_all_listing_ids(session))
+        known_price_texts = repo.get_known_price_texts(session)
     finally:
         session.close()
 
-    listings = await scrape_belgium_cars(
+    new_listings, price_changed_listings = await scrape_belgium_cars(
         radius_km=radius_km,
         min_price=min_price,
         max_price=max_price,
@@ -43,11 +45,20 @@ async def do_scrape(
         fetch_details=fetch_details,
         headless=headless,
         known_ids=known_ids,
+        known_price_texts=known_price_texts,
     )
 
     session = get_session()
     try:
-        return repo.upsert_raw_listings(session, listings)
+        new_count = repo.upsert_raw_listings(session, new_listings)
+        for listing in price_changed_listings:
+            repo.update_changed_listing(session, listing)
+        if price_changed_listings:
+            logger.info(
+                "%d listing(s) had a price change — will re-run structure/score/notify for them",
+                len(price_changed_listings),
+            )
+        return new_count, len(price_changed_listings)
     finally:
         session.close()
 
@@ -79,7 +90,7 @@ def do_analyze(*, model: str = DEFAULT_MODEL, delay: float = 1.0) -> tuple[int, 
         session.close()
 
 
-async def do_score(*, threshold: int = DEFAULT_THRESHOLD) -> tuple[int, int]:
+async def do_score(*, threshold: int = DEFAULT_THRESHOLD, min_year: int | None = DEFAULT_MIN_YEAR) -> tuple[int, int]:
     session = get_session()
     try:
         pending = repo.get_listings_needing_scoring(session)
@@ -88,7 +99,7 @@ async def do_score(*, threshold: int = DEFAULT_THRESHOLD) -> tuple[int, int]:
         structured_listings = [s for s, _ in pending]
         signals_by_id = {s.listing_id: sig for s, sig in pending if sig is not None}
         scored = await score_listings(structured_listings, signals_by_id)
-        scored = apply_decision_gate(scored, threshold=threshold)
+        scored = apply_decision_gate(scored, threshold=threshold, min_year=min_year)
         repo.save_scores(session, scored)
         opportunities = sum(1 for s in scored if s.above_threshold)
         return len(scored), opportunities
@@ -119,6 +130,7 @@ async def run_full_pipeline(
     model: str = DEFAULT_MODEL,
     delay: float = 1.0,
     threshold: int = DEFAULT_THRESHOLD,
+    min_year: int | None = DEFAULT_MIN_YEAR,
     headless: bool = True,
 ) -> None:
     """Runs every stage in sequence — used by `becarscout run` (and cron).
@@ -127,11 +139,11 @@ async def run_full_pipeline(
     through the remaining stages instead of the whole hourly run being a
     no-op."""
     try:
-        new_count = await do_scrape(
+        new_count, price_changed_count = await do_scrape(
             radius_km=radius_km, min_price=min_price, max_price=max_price,
             max_scrolls=max_scrolls, headless=headless,
         )
-        logger.info("scrape: %d new listings", new_count)
+        logger.info("scrape: %d new listings, %d price changes", new_count, price_changed_count)
     except Exception:
         logger.exception("scrape stage failed")
 
@@ -148,7 +160,7 @@ async def run_full_pipeline(
         logger.exception("analyze stage failed")
 
     try:
-        scored_count, opportunity_count = await do_score(threshold=threshold)
+        scored_count, opportunity_count = await do_score(threshold=threshold, min_year=min_year)
         logger.info("score: %d listings (%d opportunities)", scored_count, opportunity_count)
     except Exception:
         logger.exception("score stage failed")
@@ -168,7 +180,7 @@ def _cmd_login(_args: argparse.Namespace) -> None:
 
 
 def _cmd_scrape(args: argparse.Namespace) -> None:
-    new_count = asyncio.run(
+    new_count, price_changed_count = asyncio.run(
         do_scrape(
             radius_km=args.radius_km,
             min_price=args.min_price,
@@ -178,7 +190,7 @@ def _cmd_scrape(args: argparse.Namespace) -> None:
             headless=not args.headed,
         )
     )
-    print(f"{new_count} new listings saved to the database")
+    print(f"{new_count} new listings saved to the database ({price_changed_count} price changes detected)")
 
 
 def _cmd_structure(_args: argparse.Namespace) -> None:
@@ -192,13 +204,24 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
 
 
 def _cmd_score(args: argparse.Namespace) -> None:
-    count, opportunities = asyncio.run(do_score(threshold=args.threshold))
-    print(f"Scored {count} listings ({opportunities} above threshold {args.threshold})")
+    min_year = None if args.no_min_year else args.min_year
+    count, opportunities = asyncio.run(do_score(threshold=args.threshold, min_year=min_year))
+    year_note = f", newer than {min_year}" if min_year is not None else ""
+    print(f"Scored {count} listings ({opportunities} above threshold {args.threshold}{year_note})")
 
 
 def _cmd_notify(_args: argparse.Namespace) -> None:
     sent = asyncio.run(do_notify())
     print(f"Sent {sent} new opportunit{'y' if sent == 1 else 'ies'}")
+
+
+def _cmd_rescore(_args: argparse.Namespace) -> None:
+    session = get_session()
+    try:
+        count = repo.reset_scoring_for_rescore(session)
+    finally:
+        session.close()
+    print(f"{count} listings queued for re-scoring — run `becarscout score` (then `notify`) to apply it")
 
 
 def _cmd_listen(_args: argparse.Namespace) -> None:
@@ -239,6 +262,7 @@ def _cmd_whoami(_args: argparse.Namespace) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
+    min_year = None if args.no_min_year else args.min_year
     asyncio.run(
         run_full_pipeline(
             radius_km=args.radius_km,
@@ -248,6 +272,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
             model=args.model,
             delay=args.delay,
             threshold=args.threshold,
+            min_year=min_year,
             headless=not args.headed,
         )
     )
@@ -298,12 +323,20 @@ def main() -> None:
         "score", help="Score newly-analyzed listings (stages 4-5)"
     )
     score_parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD, help=f"Decision gate score threshold (default {DEFAULT_THRESHOLD})")
+    score_parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Exclude cars from this year or older, even if they'd score above threshold (default {DEFAULT_MIN_YEAR})")
+    score_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
     score_parser.set_defaults(func=_cmd_score)
 
     notify_parser = subparsers.add_parser(
         "notify", help="Send newly-scored above-threshold opportunities to Telegram (stage 6)"
     )
     notify_parser.set_defaults(func=_cmd_notify)
+
+    rescore_parser = subparsers.add_parser(
+        "rescore",
+        help="Queue every already-scored listing for re-scoring with current code (run after a scoring/baseline fix ships)",
+    )
+    rescore_parser.set_defaults(func=_cmd_rescore)
 
     listen_parser = subparsers.add_parser(
         "listen", help="Run the standing bot process that listens for thumbs up/down feedback button presses"
@@ -331,6 +364,8 @@ def main() -> None:
     run_parser.add_argument("--model", default=DEFAULT_MODEL)
     run_parser.add_argument("--delay", type=float, default=1.0)
     run_parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
+    run_parser.add_argument("--min-year", type=int, default=DEFAULT_MIN_YEAR, help=f"Exclude cars from this year or older (default {DEFAULT_MIN_YEAR})")
+    run_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
     run_parser.add_argument("--headed", action="store_true")
     run_parser.set_defaults(func=_cmd_run)
 

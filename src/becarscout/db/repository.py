@@ -34,6 +34,45 @@ def get_all_listing_ids(session: Session) -> set[str]:
     return {row_id for (row_id,) in session.execute(select(ListingRow.listing_id))}
 
 
+def get_known_price_texts(session: Session) -> dict[str, str]:
+    """listing_id -> its stored price_text, for every known listing that
+    has one — lets the scraper detect a seller changing the price on an
+    already-known listing (comparing against the grid's cheap price
+    field) without revisiting every known listing's detail page. See
+    `known_price_texts` on `scrape_belgium_cars`."""
+    rows = session.execute(
+        select(ListingRow.listing_id, ListingRow.price_text).where(ListingRow.price_text.is_not(None))
+    ).all()
+    return {listing_id: price_text for listing_id, price_text in rows}
+
+
+def update_changed_listing(session: Session, listing: RawListing) -> None:
+    """A known listing whose price changed — refreshes the raw fields
+    (price, description, photos — all re-fetched from the same
+    detail-page revisit that confirmed the price change) and resets the
+    downstream stage timestamps so it flows back through structure/score/
+    notify as if freshly scraped. `scraped_at` (first-seen time) is left
+    untouched. Analysis (`analyzed_at`) is only reset if the description
+    text itself actually changed too — no point re-spending a Mistral
+    call on stage 3 when only the price moved and the seller's wording
+    didn't."""
+    row = session.get(ListingRow, listing.listing_id)
+    if row is None:
+        return
+    description_changed = listing.description is not None and listing.description != row.description
+
+    row.price_text = listing.price_text
+    row.description = listing.description
+    row.photo_urls_json = json.dumps(listing.photo_urls)
+    row.listed_relative_text = listing.listed_relative_text
+    row.structured_at = None
+    row.scored_at = None
+    row.notified_at = None
+    if description_changed:
+        row.analyzed_at = None
+    session.commit()
+
+
 def upsert_raw_listings(session: Session, listings: list[RawListing]) -> int:
     """Inserts new listings only — a listing already known (by listing_id)
     is left untouched, including everything the later stages computed for
@@ -246,3 +285,26 @@ def mark_notified(session: Session, listing_ids: list[str]) -> None:
         if row is not None:
             row.notified_at = _now()
     session.commit()
+
+
+def reset_scoring_for_rescore(session: Session) -> int:
+    """Nulls `scored_at` for every analyzed listing so `becarscout score`
+    picks all of them up again with whatever the *current* code computes
+    — incremental processing (`WHERE scored_at IS NULL`) means a fix to
+    scoring.py/baseline.py/analyzer's schema otherwise only ever affects
+    listings scored *after* the fix; anything already scored keeps its
+    old, possibly now-known-wrong value forever (see Project.md's
+    Infrastructure notes — found live via the 1986 Ford F-150 case, which
+    kept its pre-fix +72 score for days). Leaves `notified_at` untouched
+    on purpose — re-scoring shouldn't by itself cause a re-notification
+    for something already sent; `becarscout score` + `becarscout notify`
+    will only notify what's newly `above_threshold` and still unset."""
+    result = session.execute(
+        select(ListingRow.listing_id).where(ListingRow.analyzed_at.is_not(None))
+    ).scalars().all()
+    for listing_id in result:
+        row = session.get(ListingRow, listing_id)
+        if row is not None:
+            row.scored_at = None
+    session.commit()
+    return len(result)
