@@ -1,0 +1,5 @@
+# Runs the full pipeline (scrape -> structure -> analyze -> score -> notify)
+# at the top of every hour. Must end with a blank line or cron silently
+# ignores it.
+0 * * * * /app/docker/run_pipeline.sh
+

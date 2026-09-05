@@ -1,0 +1,13 @@
+services:
+  becarscout:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      # Everything persistent lives here: the SQLite DB, the Facebook
+      # login session, the 2dehands.be pricing cache, and pipeline logs.
+      # The login session (data/.session/) MUST be created by running
+      # `becarscout login` on a machine with a real display BEFORE
+      # starting this container — see README.md.
+      - ./data:/app/data
+    restart: unless-stopped

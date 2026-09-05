@@ -1,0 +1,35 @@
+[project]
+name = "becarscout"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ANOUARELIDRISSI", email = "118124279+ANOUARELIDRISSI@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastembed>=0.8.0",
+    "langgraph>=1.2.11",
+    "litellm>=1.99.0",
+    "mem0ai>=2.0.20",
+    "mistralai>=2.9.4",
+    "playwright>=1.62.0",
+    "pydantic>=2.13.5",
+    "python-dotenv>=1.2.3",
+    "python-telegram-bot>=22.8",
+    "sqlalchemy>=2.0.52",
+    "trafilatura>=2.2.0",
+]
+
+[project.scripts]
+becarscout = "becarscout:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

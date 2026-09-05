@@ -1,0 +1,274 @@
+import logging
+from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram import ReplyKeyboardRemove
+from telegram.ext import  CommandHandler, MessageHandler, filters, ConversationHandler
+from becarscout.bot.bot_config import TELEGRAM_BOT_TOKEN
+from becarscout.bot.handlers.start_handler import start
+from becarscout.bot.handlers.settings_handler import settings
+from becarscout.bot.handlers.subscriptions_handler import handle_subscriptions
+from becarscout.bot.handlers.check_preferences_handler import handle_check_preferences, handle_remove_preference_selection, remove_preference_callback
+from becarscout.bot.handlers.search_new_vehicle_handler import  (
+    handle_search_new_vehicle,
+    ask_vehicle_type,
+    ask_brand,
+    ask_model,
+    ask_condition,
+    ask_price_range,
+    ask_year_range,
+    ask_mileage_range,
+    ask_car_color,
+    ask_car_condition,
+    ask_location,
+    ask_transmission,
+    ask_fuel_type,
+    ask_drive_type,
+    ask_doors,
+    ask_listing_condition,
+    ask_keywords,
+    ask_has_images,
+    confirm_preferences
+)
+from telegram import Update
+from telegram.ext import ContextTypes
+from becarscout.bot.logging_config import setup_logging
+from becarscout.bot.database.db import init_db, SessionLocal
+from becarscout.bot.database.models import User, ContactedSeller
+from telegram import BotCommand
+from telegram.ext import CallbackQueryHandler
+from becarscout.bot.handlers.button_handler import button_handler
+from becarscout.bot.handlers.support_handler import handle_support
+from becarscout.bot.handlers.admin_pannel_handler import handle_admin_pannel, handle_admin_panel_callback
+from  bot.handlers.update_handler import handle_update
+from becarscout.bot.handlers.report_handler import handle_report
+
+import nest_asyncio
+nest_asyncio.apply()
+
+# Define states for the conversation handler
+MAIN_MENU = range(1)  # Use a single state
+
+# Conversation states
+(
+    SELECT_VEHICLE_TYPE,
+    SELECT_BRAND,
+    SELECT_MODEL,
+    SELECT_CONDITION,
+    SELECT_PRICE_RANGE,
+    SELECT_YEAR_RANGE,
+    SELECT_MILEAGE_RANGE,
+    SELECT_CAR_COLOR,
+    SELECT_CAR_CONDITION,
+    SELECT_OPTIONAL_LOCATION,
+    SELECT_OPTIONAL_TRANSMISSION,
+    SELECT_OPTIONAL_FUEL_TYPE,
+    SELECT_OPTIONAL_DRIVE_TYPE,
+    SELECT_OPTIONAL_DOORS,
+    SELECT_OPTIONAL_LISTING_CONDITION,
+    SELECT_OPTIONAL_KEYWORDS,
+    SELECT_OPTIONAL_IMAGES,
+    CONFIRM,
+) = range(18)
+
+REMOVE_PREFERENCE = 19
+
+REPORT_STATE, ADMIN_STATE, SUPPORT_STATE, UPDATE_STATE = range(20, 24)
+
+# Logging setup
+logger = logging.getLogger(__name__)
+
+async def set_bot_commands(application):
+    commands = [
+        BotCommand("start", "🚀 Start the bot"),
+        BotCommand("search", "🔍 New search"),
+        BotCommand("preferences", "My preferences"),
+        BotCommand("update", "🔄 Update"),
+        BotCommand("settings", "⚙️ Settings"),
+        BotCommand("support", "💬 Support"),
+        BotCommand("report", "Report"),
+        BotCommand("cancel", "Cancel"),
+        BotCommand("admin", "Admin Pannel"),
+
+    ]
+    await application.bot.set_my_commands(commands)
+
+async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Interrupts the current conversation and ends the ConversationHandler."""
+    await update.message.reply_text(
+        text="The transport search dialogue has been interrupted. To start over, enter /search.",
+        reply_markup=ReplyKeyboardRemove()  # Removes the keyboard
+    )
+    return ConversationHandler.END
+
+
+
+async def main():
+    # Initialize logging
+    setup_logging()
+
+    # Check for token
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("The TELEGRAM_BOT_TOKEN is missing. Please check your .env file.")
+        raise ValueError("The TELEGRAM_BOT_TOKEN is missing. Please check your .env file.")
+    
+    # Initialize database
+    init_db()
+    logger.info("Database initialized successfully.")
+    
+    # Create the Telegram Bot application
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Register command handlers
+    application.add_handler(CommandHandler("settings", settings))
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [
+                MessageHandler(
+                    filters.TEXT & filters.Regex("^Setup vehicle preferences$"),
+                    handle_search_new_vehicle
+                ),
+                MessageHandler(
+                    filters.TEXT & filters.Regex("^Check preferences$"),
+                    handle_check_preferences
+                ),
+                MessageHandler(
+                    filters.TEXT & filters.Regex("^Subscriptions$"),
+                    handle_subscriptions
+                ),
+                # Add a fallback to catch everything else
+                # MessageHandler(filters.TEXT, fallback_handler),
+            ],
+            SELECT_VEHICLE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_vehicle_type)],
+            SELECT_BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_brand)],
+            SELECT_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_model)],
+            SELECT_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_condition)],
+            SELECT_PRICE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_price_range)],
+            SELECT_YEAR_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_year_range)],
+            SELECT_MILEAGE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_mileage_range)],
+            SELECT_CAR_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_car_color)],
+            SELECT_CAR_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_car_condition)],
+            SELECT_OPTIONAL_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_location)],
+            SELECT_OPTIONAL_TRANSMISSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_transmission)],
+            SELECT_OPTIONAL_FUEL_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_fuel_type)],
+            SELECT_OPTIONAL_DRIVE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_drive_type)],
+            SELECT_OPTIONAL_DOORS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_doors)],
+            SELECT_OPTIONAL_LISTING_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_listing_condition)],
+            SELECT_OPTIONAL_KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_keywords)],
+            SELECT_OPTIONAL_IMAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_has_images)],
+            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_preferences)],
+            REMOVE_PREFERENCE : [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_remove_preference_selection)],
+        },
+        fallbacks = [
+            MessageHandler(filters.COMMAND, fallback_handler)
+        ],
+    )
+    
+    search_vehicle_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("search", handle_search_new_vehicle)],
+        states = {
+            SELECT_VEHICLE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_vehicle_type)],
+            SELECT_BRAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_brand)],
+            SELECT_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_model)],
+            SELECT_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_condition)],
+            SELECT_PRICE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_price_range)],
+            SELECT_YEAR_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_year_range)],
+            SELECT_MILEAGE_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_mileage_range)],
+            SELECT_CAR_COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_car_color)],
+            SELECT_CAR_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_car_condition)],
+            SELECT_OPTIONAL_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_location)],
+            SELECT_OPTIONAL_TRANSMISSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_transmission)],
+            SELECT_OPTIONAL_FUEL_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_fuel_type)],
+            SELECT_OPTIONAL_DRIVE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_drive_type)],
+            SELECT_OPTIONAL_DOORS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_doors)],
+            SELECT_OPTIONAL_LISTING_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_listing_condition)],
+            SELECT_OPTIONAL_KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_keywords)],
+            SELECT_OPTIONAL_IMAGES: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_has_images)],
+            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_preferences)],
+        },
+        fallbacks = [
+            MessageHandler(filters.COMMAND, fallback_handler)
+        ],
+    )
+    
+    preferences_vehicle_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("preferences", handle_check_preferences)],
+        states = {
+            REMOVE_PREFERENCE : [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_remove_preference_selection)]
+        },
+        fallbacks = [
+            MessageHandler(filters.COMMAND, fallback_handler)
+        ],
+    )
+    
+    report_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("report", handle_report)],
+        states={
+            REPORT_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", fallback_handler)],
+    )
+
+    admin_pannel_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("admin", handle_admin_pannel)],
+        states={
+            ADMIN_STATE: [
+                # Instead of a MessageHandler, we want a CallbackQueryHandler:
+                CallbackQueryHandler(handle_admin_panel_callback)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", fallback_handler)],
+    )
+
+    support_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("support", handle_support)],
+        states={
+            SUPPORT_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", fallback_handler)],
+    )
+
+    update_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("update", handle_update)],
+        states={
+            UPDATE_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", fallback_handler)],
+    )
+
+    # Add handlers to the application
+    application.add_handler(report_conv_handler)
+    application.add_handler(admin_pannel_conv_handler)
+    application.add_handler(support_conv_handler)
+    application.add_handler(update_conv_handler)
+
+    application.add_handler(conv_handler)
+    application.add_handler(search_vehicle_conv_handler)
+    application.add_handler(preferences_vehicle_conv_handler)
+    application.add_handler(
+        CallbackQueryHandler(button_handler, pattern=r"^some_prefix:.+")
+    )
+    # Теперь remove_pref:\d+$ не «зацепится» за этот pattern
+    application.add_handler(
+        CallbackQueryHandler(remove_preference_callback, pattern=r"^remove_pref:\d+$")
+    )
+    # Set bot commands
+    await set_bot_commands(application)
+    
+    # Start polling
+    logger.info("Starting bot polling...")
+    await application.run_polling()
+    
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
+
+
+

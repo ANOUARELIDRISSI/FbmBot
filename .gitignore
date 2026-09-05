@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# All persistent runtime state (SQLite DB, Facebook login session, pricing
+# cache, feedback log, pipeline log) — never commit
+data/
+
+# Env vars
+.env
