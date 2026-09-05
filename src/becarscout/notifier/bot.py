@@ -9,12 +9,14 @@ for this stage is much simpler: push a card per opportunity with inline
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
 
 from dotenv import load_dotenv
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -51,6 +53,36 @@ SETTINGS_CALLBACK_PREFIX = "set"
 # per-process only — acceptable here since a listener restart losing a
 # half-finished prompt just means re-tapping the button, no data at risk.
 _pending_prompts: dict[int, str] = {}
+
+# Chat id -> remaining steps in a guided /setup run, seeded by _start_wizard
+# and consumed by _advance_wizard after each step is successfully applied.
+# A chat not in this dict is simply not mid-setup -- single /budget-style
+# edits never touch it.
+_wizard_queue: dict[int, list[str]] = {}
+_WIZARD_STEPS = ["budget", "minyear", "radius", "threshold"]
+
+# Chat ids with a /find pipeline run currently in flight -- stops a second
+# tap from launching an overlapping `becarscout run` subprocess on top of
+# one already going.
+_find_running: set[int] = set()
+
+_QUICK_PICKS: dict[str, dict[str, dict[str, object]]] = {
+    "threshold": {
+        "loose": {"threshold": 10},
+        "balanced": {"threshold": 20},
+        "strict": {"threshold": 35},
+    },
+    "budget": {
+        "under5k": {"min_price": None, "max_price": 5000},
+        "5to15k": {"min_price": 5000, "max_price": 15000},
+        "15kplus": {"min_price": 15000, "max_price": None},
+    },
+}
+
+_QUICK_PICK_LABELS: dict[str, list[tuple[str, str]]] = {
+    "threshold": [("loose", "😌 Loose"), ("balanced", "⚖️ Balanced"), ("strict", "🔥 Strict")],
+    "budget": [("under5k", "Under €5,000"), ("5to15k", "€5,000-15,000"), ("15kplus", "€15,000+")],
+}
 
 _SETTINGS_PROMPTS: dict[str, str] = {
     "budget": (
@@ -96,7 +128,8 @@ _SETTINGS_PROMPTS: dict[str, str] = {
 _WELCOME_TEXT = (
     "👋 Hi! I'm BE-CarScout — I search Facebook Marketplace for used cars in Belgium "
     "and message you here whenever I spot a good deal.\n\n"
-    "Let's set you up — tap /settings to see and change:\n"
+    "Tap 🚀 Quick setup below and I'll ask a few quick questions to get you started -- "
+    "or use /settings anytime to see and change:\n"
     "💶 your budget\n"
     "📅 the oldest year you'll consider\n"
     "📍 how far I should search\n"
@@ -106,7 +139,8 @@ _WELCOME_TEXT = (
     "🔎 /find — search right now instead of waiting for the next hour\n"
     "🔍 /search — look through cars I've already found, e.g. /search golf\n"
     "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
-    "so I get better at picking cars for you over time\n\n"
+    "so I get better at picking cars for you over time\n"
+    "🚫 /cancel — stop whatever it's currently asking you\n\n"
     "Type /settings anytime to see your current setup."
 )
 
@@ -278,6 +312,23 @@ async def _reply(update: Update, text: str, reply_markup: InlineKeyboardMarkup |
         await update.get_bot().send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
 
 
+def _quick_pick_keyboard(setting: str) -> InlineKeyboardMarkup | None:
+    """A row of one-tap common values for settings where typing a number
+    is friction a lot of users don't need -- e.g. "Loose/Balanced/Strict"
+    instead of remembering that higher thresholds mean fewer, better
+    matches. Only defined for a couple of settings (see _QUICK_PICK_LABELS);
+    returns None for everything else, so callers can skip attaching a
+    keyboard at all."""
+    options = _QUICK_PICK_LABELS.get(setting)
+    if not options:
+        return None
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"{SETTINGS_CALLBACK_PREFIX}:qp:{setting}:{key}")
+        for key, label in options
+    ]
+    return InlineKeyboardMarkup([buttons])
+
+
 def _settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -334,45 +385,138 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-async def _handle_settings_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles taps on the `/settings` buttons — prompts for the new value
-    exactly like sending e.g. `/budget` with no arguments would."""
+async def _start_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/setup` and the "🚀 Quick setup" button — chains the four core
+    settings (budget, min year, radius, threshold) into one guided flow
+    instead of making a new user tap four separate `/settings` buttons.
+    Reuses each setting's own no-args prompt (`_advance_wizard` just calls
+    the matching /command with empty args), so there's exactly one place
+    that owns each prompt's wording."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    _wizard_queue[chat.id] = list(_WIZARD_STEPS)
+    await _reply(update, "🚀 Let's get you set up — I'll ask a few quick questions. Send /cancel anytime to stop.")
+    await _advance_wizard(chat.id, update, context)
+
+
+async def _advance_wizard(chat_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Called after a setting is successfully applied -- moves to the next
+    step of a guided /setup run, or finishes it. A no-op for a chat that
+    isn't mid-setup (the common case: a single /budget-style edit)."""
+    queue = _wizard_queue.get(chat_id)
+    if queue is None:
+        return
+    if not queue:
+        del _wizard_queue[chat_id]
+        await _reply(update, "🎉 All set! I'll use these from your next search onward. Type /settings anytime to change something, or /find to search right now.")
+        return
+    next_setting = queue.pop(0)
+    context.args = []
+    await _PROMPTABLE_COMMANDS[next_setting](update, context)
+
+
+async def _handle_quick_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, setting: str, key: str) -> None:
+    """Handles a one-tap quick-pick button (see `_QUICK_PICKS`) -- applies
+    the change directly rather than routing through a /command's text
+    parsing, since these buttons carry their own fixed values."""
+    changes = _QUICK_PICKS.get(setting, {}).get(key)
+    if changes is None:
+        return
+    session = get_session()
+    try:
+        settings = repo.update_pipeline_settings(session, **changes)
+    finally:
+        session.close()
+
+    chat = update.effective_chat
+    if chat:
+        _pending_prompts.pop(chat.id, None)
+
+    if setting == "threshold":
+        text = f"✅ Got it — I'll only message you about cars that score {settings.threshold} or higher."
+    else:
+        text = f"✅ Budget set: {_budget_text(settings)}"
+    await _reply(update, f"{text}\nThis applies from your next search onward.")
+
+    if chat:
+        await _advance_wizard(chat.id, update, context)
+
+
+async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles taps on the `/settings` buttons — routes to the same
+    handler its matching /command uses, so there's one place that owns
+    each setting's prompt wording and quick-pick keyboard."""
     query = update.callback_query
     if not query or not query.data or not update.effective_chat:
         return
     await query.answer()
-    try:
-        _, setting = query.data.split(":", 1)
-    except ValueError:
-        return
-    prompt = _SETTINGS_PROMPTS.get(setting)
-    if prompt is None:
-        return
-    _pending_prompts[update.effective_chat.id] = setting
-    if query.message:
-        await query.message.reply_text(prompt)
+    parts = query.data.split(":")
 
-
-async def _handle_plain_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Completes a pending `/budget`/`/minyear`/`/threshold`/`/radius`
-    prompt — whatever plain text the user sends next is treated as the
-    arguments that command would have taken directly (`/budget 15000` and
-    replying `15000` to the prompt do the same thing)."""
-    chat = update.effective_chat
-    if not chat or chat.id not in _pending_prompts or not update.message or not update.message.text:
+    if len(parts) == 4 and parts[1] == "qp":
+        await _handle_quick_pick(update, context, parts[2], parts[3])
         return
-    command = _pending_prompts.pop(chat.id)
-    handler = _PROMPTABLE_COMMANDS.get(command)
+
+    if len(parts) != 2:
+        return
+    setting = parts[1]
+    if setting == "wizard":
+        await _start_wizard(update, context)
+        return
+
+    handler = _PROMPTABLE_COMMANDS.get(setting)
     if handler is None:
         return
-    context.args = update.message.text.split()
+    context.args = []
     await handler(update, context)
 
 
-async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/cancel` — clears a pending `/budget`-style prompt or an in-progress
+    `/setup` run. Without this, a stray message sent while a prompt is
+    pending would otherwise get silently swallowed as that prompt's
+    answer, with no way to back out."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    had_prompt = _pending_prompts.pop(chat.id, None) is not None
+    had_wizard = _wizard_queue.pop(chat.id, None) is not None
+    if had_prompt or had_wizard:
+        await _reply(update, "Okay, cancelled — nothing changed.")
+    else:
+        await _reply(update, "Nothing to cancel.")
+
+
+async def _handle_plain_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Completes a pending `/budget`-style prompt — whatever plain text the
+    user sends next is treated as the arguments that command would have
+    taken directly (`/budget 15000` and replying `15000` to the prompt do
+    the same thing). The pending prompt is only cleared once the handler
+    actually applies a value (`applied` is True) -- on invalid input the
+    handler shows an error and the same prompt stays armed, so the user
+    can just try again without retyping the full command."""
+    chat = update.effective_chat
+    if not chat or chat.id not in _pending_prompts or not update.message or not update.message.text:
+        return
+    setting = _pending_prompts[chat.id]
+    handler = _PROMPTABLE_COMMANDS.get(setting)
+    if handler is None:
+        _pending_prompts.pop(chat.id, None)
+        return
+    context.args = update.message.text.split()
+    applied = await handler(update, context)
+    if not applied:
+        return
+    _pending_prompts.pop(chat.id, None)
+    await _advance_wizard(chat.id, update, context)
+
+
+async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/budget` — sets the price range future scrapes search within.
     `/budget 15000` sets a max only; `/budget 3000 15000` sets both;
-    `/budget off` clears it entirely."""
+    `/budget off` clears it entirely. Returns whether a value was actually
+    applied (used by `_handle_plain_reply`/`_advance_wizard` to know
+    whether to move on or keep the prompt armed for a retry)."""
     args = context.args or []
     session = get_session()
     try:
@@ -380,8 +524,12 @@ async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             settings = repo.get_pipeline_settings(session)
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "budget"
-            await _reply(update, f"Your budget is currently: {_budget_text(settings)}\n\n{_SETTINGS_PROMPTS['budget']}")
-            return
+            await _reply(
+                update,
+                f"Your budget is currently: {_budget_text(settings)}\n\n{_SETTINGS_PROMPTS['budget']}",
+                reply_markup=_quick_pick_keyboard("budget"),
+            )
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, min_price=None, max_price=None)
@@ -389,20 +537,21 @@ async def _cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             max_price = _parse_int_arg(args[0])
             if max_price is None:
                 await _reply(update, "That doesn't look like a number. Try just a number, like 15000.")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, max_price=max_price)
         else:
             min_price, max_price = _parse_int_arg(args[0]), _parse_int_arg(args[1])
             if min_price is None or max_price is None:
                 await _reply(update, "Those don't look like numbers. Try two numbers, like 3000 15000.")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, min_price=min_price, max_price=max_price)
     finally:
         session.close()
     await _reply(update, f"✅ Budget set: {_budget_text(settings)}\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/minyear 2015` excludes cars from that year or older regardless
     of score; `/minyear off` disables the cutoff entirely."""
     args = context.args or []
@@ -414,7 +563,7 @@ async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "minyear"
             await _reply(update, f"Right now I'll consider cars from: {current}\n\n{_SETTINGS_PROMPTS['minyear']}")
-            return
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, min_year=None)
@@ -422,7 +571,7 @@ async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             year = _parse_int_arg(args[0])
             if year is None:
                 await _reply(update, "That doesn't look like a year. Try a number like 2015.")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, min_year=year)
     finally:
         session.close()
@@ -432,9 +581,10 @@ async def _cmd_minyear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else "✅ I'll now consider cars from any year."
     )
     await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/threshold 30` — a listing needs at least this score to reach
     Telegram; higher means fewer, more confident opportunities."""
     args = context.args or []
@@ -444,19 +594,24 @@ async def _cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             settings = repo.get_pipeline_settings(session)
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "threshold"
-            await _reply(update, f"Right now, how picky I am: {settings.threshold}\n\n{_SETTINGS_PROMPTS['threshold']}")
-            return
+            await _reply(
+                update,
+                f"Right now, how picky I am: {settings.threshold}\n\n{_SETTINGS_PROMPTS['threshold']}",
+                reply_markup=_quick_pick_keyboard("threshold"),
+            )
+            return False
         value = _parse_int_arg(args[0])
         if value is None:
             await _reply(update, "That doesn't look like a number. Try a number like 20.")
-            return
+            return False
         settings = repo.update_pipeline_settings(session, threshold=value)
     finally:
         session.close()
     await _reply(update, f"✅ Got it — I'll only message you about cars that score {settings.threshold} or higher.\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/radius 150` — search radius in km around each Belgian hub city."""
     args = context.args or []
     session = get_session()
@@ -466,18 +621,19 @@ async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "radius"
             await _reply(update, f"Right now I search {settings.radius_km} km around each city.\n\n{_SETTINGS_PROMPTS['radius']}")
-            return
+            return False
         km = _parse_int_arg(args[0])
         if km is None or km <= 0:
             await _reply(update, "That doesn't look like a distance. Try a positive number like 100.")
-            return
+            return False
         settings = repo.update_pipeline_settings(session, radius_km=km)
     finally:
         session.close()
     await _reply(update, f"✅ I'll now search {settings.radius_km} km around each city.\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/mileage 150000` excludes cars with more km than that regardless
     of score; `/mileage off` disables the cutoff. A listing with no
     detected mileage still passes -- see `scoring/gate.py`'s docstring."""
@@ -490,7 +646,7 @@ async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "mileage"
             await _reply(update, f"Right now, highest mileage I'll accept: {current}\n\n{_SETTINGS_PROMPTS['mileage']}")
-            return
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, max_mileage_km=None)
@@ -498,7 +654,7 @@ async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             km = _parse_int_arg(args[0])
             if km is None or km <= 0:
                 await _reply(update, "That doesn't look like a distance. Try a positive number like 150000.")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, max_mileage_km=km)
     finally:
         session.close()
@@ -508,9 +664,10 @@ async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else "✅ No mileage limit anymore."
     )
     await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/make bmw, toyota` only shows those brands; `/make off` clears
     it. Unlike /mileage or /minyear, a listing whose brand wasn't
     detected does *not* pass once this filter is set -- see
@@ -524,7 +681,7 @@ async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "make"
             await _reply(update, f"Right now, brands I'll show you: {current}\n\n{_SETTINGS_PROMPTS['make']}")
-            return
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, makes=None)
@@ -532,7 +689,7 @@ async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             wanted = _parse_csv_arg(args)
             if not wanted:
                 await _reply(update, "I didn't catch a brand there. Try something like: bmw, toyota")
-                return
+                return False
             known = {m.lower() for m in MAKES}
             unknown = [m for m in wanted if m not in known]
             settings = repo.update_pipeline_settings(session, makes=",".join(wanted))
@@ -542,9 +699,10 @@ async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         session.close()
     confirmation = f"✅ I'll only show you: {settings.makes.replace(',', ', ')}" if settings.makes else "✅ I'll show you any brand again."
     await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/fuel diesel, hybrid` only shows those fuel types; `/fuel off`
     clears it. Strict about valid values (unlike /make) since the set of
     real fuel types is small and fixed -- see `structurer.parse.FUEL_TYPES`."""
@@ -557,7 +715,7 @@ async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "fuel"
             await _reply(update, f"Right now, fuel types I'll show you: {current}\n\n{_SETTINGS_PROMPTS['fuel']}")
-            return
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, fuel_types=None)
@@ -566,15 +724,16 @@ async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             invalid = [f for f in wanted if f not in FUEL_TYPES]
             if invalid:
                 await _reply(update, f"I don't recognize \"{', '.join(invalid)}\". Valid options: {', '.join(FUEL_TYPES)}")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, fuel_types=",".join(wanted))
     finally:
         session.close()
     confirmation = f"✅ I'll only show you: {settings.fuel_types.replace(',', ', ')}" if settings.fuel_types else "✅ I'll show you any fuel type again."
     await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+    return True
 
 
-async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """`/transmission automatic` or `/transmission manual`; `/transmission
     off` clears it. Same strict-values reasoning as /fuel."""
     args = context.args or []
@@ -586,7 +745,7 @@ async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if update.effective_chat:
                 _pending_prompts[update.effective_chat.id] = "transmission"
             await _reply(update, f"Right now: {current}\n\n{_SETTINGS_PROMPTS['transmission']}")
-            return
+            return False
 
         if args[0].lower() == "off":
             settings = repo.update_pipeline_settings(session, transmission=None)
@@ -594,12 +753,13 @@ async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             wanted = args[0].strip().lower()
             if wanted not in TRANSMISSIONS:
                 await _reply(update, f"I don't recognize \"{wanted}\". Valid options: {', '.join(TRANSMISSIONS)}")
-                return
+                return False
             settings = repo.update_pipeline_settings(session, transmission=wanted)
     finally:
         session.close()
     confirmation = f"✅ I'll only show you: {settings.transmission}" if settings.transmission else "✅ No preference anymore."
     await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+    return True
 
 
 # Maps a pending-prompt key (see _SETTINGS_PROMPTS) to the same handler its
@@ -662,25 +822,51 @@ async def _cmd_find(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     adds no new concurrency risk."""
     if not update.effective_chat:
         return
+    chat_id = update.effective_chat.id
+    if chat_id in _find_running:
+        await _reply(update, "🔎 Still searching from a moment ago -- I'll message you as soon as that's done.")
+        return
+    _find_running.add(chat_id)
     await _reply(update, "🔎 Searching Facebook Marketplace now -- this can take a few minutes, I'll message you again when I'm done.")
-    asyncio.create_task(_run_find_pipeline(update.effective_chat.id, update.get_bot()))
+    asyncio.create_task(_run_find_pipeline(chat_id, update.get_bot()))
+
+
+async def _send_typing_until_cancelled(bot: Bot, chat_id: int) -> None:
+    """A Telegram "typing…" indicator only lasts ~5s, so it has to be
+    resent periodically for the whole duration of a multi-minute /find
+    run -- otherwise the chat looks frozen with no sign anything is
+    happening. Cancelled from `_run_find_pipeline`'s `finally` once the
+    subprocess finishes."""
+    while True:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception:
+            logger.exception("Failed to send typing indicator for /find")
+        await asyncio.sleep(4)
 
 
 async def _run_find_pipeline(chat_id: int, bot: Bot) -> None:
+    typing_task = asyncio.create_task(_send_typing_until_cancelled(bot, chat_id))
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "uv", "run", "becarscout", "run",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-    except Exception:
-        logger.exception("Failed to launch pipeline run for /find")
-        await bot.send_message(chat_id=chat_id, text="😕 Couldn't start the search -- please tell whoever manages this bot.")
-        return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "uv", "run", "becarscout", "run",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+        except Exception:
+            logger.exception("Failed to launch pipeline run for /find")
+            await bot.send_message(chat_id=chat_id, text="😕 Couldn't start the search -- please tell whoever manages this bot.")
+            return
 
-    output = stdout.decode("utf-8", errors="replace") if stdout else ""
-    await bot.send_message(chat_id=chat_id, text=_summarize_find_output(output))
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+        await bot.send_message(chat_id=chat_id, text=_summarize_find_output(output))
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
+        _find_running.discard(chat_id)
 
 
 def _format_search_hit(row: ListingRow) -> str:
@@ -757,6 +943,7 @@ async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
 
 _BOT_COMMANDS = [
     BotCommand("start", "What I do and how to set me up"),
+    BotCommand("setup", "Quick guided setup (budget, year, area, pickiness)"),
     BotCommand("find", "Search for cars right now"),
     BotCommand("search", "Look through cars I've already found, e.g. /search golf"),
     BotCommand("settings", "See and change your budget, year, area, pickiness"),
@@ -770,15 +957,38 @@ _BOT_COMMANDS = [
     BotCommand("transmission", "Only show automatic or manual"),
     BotCommand("reviewfeedback", "See patterns in the cars you liked/disliked"),
     BotCommand("validate", "Apply what the last review suggested"),
+    BotCommand("cancel", "Stop whatever it's currently asking you"),
     BotCommand("help", "Show this list again"),
 ]
+
+_QUICK_SETUP_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🚀 Quick setup", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:wizard")]]
+)
 
 
 async def _cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/start` (Telegram's standard first-contact command) and `/help` —
     a plain-language welcome explaining what the bot does and how to set
     it up, for anyone who isn't already familiar with the command names."""
-    await _reply(update, _WELCOME_TEXT)
+    await _reply(update, _WELCOME_TEXT, reply_markup=_QUICK_SETUP_KEYBOARD)
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registered as the Application's catch-all error handler -- without
+    this, an unhandled exception inside any command/callback just vanishes
+    into the container logs and the user sees nothing at all, which reads
+    as "the bot is broken" with no way to tell. Best-effort: if even the
+    error notification fails (e.g. the chat is unreachable), it's logged
+    and swallowed rather than raised again."""
+    logger.error("Unhandled error in a Telegram handler", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="😕 Something went wrong on my end -- try again in a moment.",
+            )
+        except Exception:
+            logger.exception("Failed to notify the chat about the error")
 
 
 async def _post_init(application) -> None:
@@ -803,6 +1013,8 @@ def run_feedback_listener() -> None:
     )
     application.add_handler(CommandHandler("start", _cmd_start))
     application.add_handler(CommandHandler("help", _cmd_start))
+    application.add_handler(CommandHandler("setup", _start_wizard))
+    application.add_handler(CommandHandler("cancel", _cmd_cancel))
     application.add_handler(CommandHandler("find", _cmd_find))
     application.add_handler(CommandHandler("search", _cmd_search))
     application.add_handler(CommandHandler("settings", _cmd_settings))
@@ -820,5 +1032,6 @@ def run_feedback_listener() -> None:
     # excludes slash commands, but handler order still matters for any
     # non-command text the other handlers don't claim.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_plain_reply))
+    application.add_error_handler(_error_handler)
     logger.info("Listening for feedback button presses and commands... (Ctrl+C to stop)")
     application.run_polling()

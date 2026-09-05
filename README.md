@@ -118,10 +118,16 @@ names. All bot replies use plain, non-technical language on purpose (no "scrape"
 pipeline jargon) — anyone can use this without knowing how it works internally.
 
 - `/start` or `/help` — a plain-language welcome message explaining what the bot does and
-  how to set it up. Send this first if you're new.
+  how to set it up, with a "🚀 Quick setup" button. Send this first if you're new.
+- `/setup` — a guided flow through the four core settings (budget, min year, radius,
+  threshold) one question at a time, instead of tapping four separate `/settings` buttons.
+- `/cancel` — stops whatever it's currently asking you (a pending prompt or an in-progress
+  `/setup`) without changing anything.
 - `/find` — runs the full pipeline right now (scrape → structure → analyze → score →
-  notify) instead of waiting for the next hourly cron tick. Replies immediately, then
-  messages again with a summary once the run finishes (can take a few minutes).
+  notify) instead of waiting for the next hourly cron tick. Shows a "typing…" indicator the
+  whole time so a multi-minute wait doesn't look like the bot froze, and a second `/find`
+  while one's already running just says so instead of starting an overlapping run. Replies
+  immediately, then messages again with a summary once the run finishes.
 - `/search <keyword>` — looks through listings already scraped for a make/model/title
   match, e.g. `/search golf`. Doesn't scrape anything new — see `/find` for that.
 - `/settings` — shows every filter below at once, with buttons to change any of them.
@@ -149,7 +155,12 @@ pipeline jargon) — anyone can use this without knowing how it works internally
 `/budget`, `/minyear`, `/threshold`, `/radius`, `/mileage`, `/make`, `/fuel`, and
 `/transmission` all also work as a two-step prompt: send the command with no arguments (or
 tap its button under `/settings`) and the bot asks for the value, then applies whatever you
-type next — no need to remember the exact argument syntax.
+type next — no need to remember the exact argument syntax. `/budget` and `/threshold` also
+show quick-pick buttons (e.g. "😌 Loose / ⚖️ Balanced / 🔥 Strict") for the common cases, so
+typing a number is optional. Invalid input (a typo, an out-of-range value) leaves the same
+prompt armed rather than silently giving up — just send another try, or `/cancel` to back
+out entirely. Any other unhandled error is caught by a bot-wide error handler that tells you
+something went wrong instead of just going silent.
 
 Every setting above takes effect from the *next* scrape/score run onward — cron always
 invokes `becarscout run` with no flags, and it resolves each parameter as

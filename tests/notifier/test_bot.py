@@ -3,7 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from becarscout.db.models import ListingRow
-from becarscout.notifier.bot import _budget_text, _format_search_hit, _parse_csv_arg, _parse_int_arg, _summarize_find_output
+from becarscout.notifier.bot import (
+    _PROMPTABLE_COMMANDS,
+    _QUICK_PICK_LABELS,
+    _QUICK_PICKS,
+    _WIZARD_STEPS,
+    _budget_text,
+    _format_search_hit,
+    _parse_csv_arg,
+    _parse_int_arg,
+    _quick_pick_keyboard,
+    _summarize_find_output,
+)
 from becarscout.settings import PipelineSettings
 
 
@@ -109,3 +120,46 @@ def test_summarize_find_output_handles_singular_listing():
 def test_summarize_find_output_falls_back_when_nothing_recognizable():
     text = _summarize_find_output("some unrelated crash traceback")
     assert "went wrong" in text
+
+
+def test_quick_pick_keyboard_returns_none_for_settings_without_one():
+    assert _quick_pick_keyboard("minyear") is None
+    assert _quick_pick_keyboard("radius") is None
+    assert _quick_pick_keyboard("nonexistent") is None
+
+
+def test_quick_pick_keyboard_threshold_has_one_button_per_option():
+    keyboard = _quick_pick_keyboard("threshold")
+    assert keyboard is not None
+    buttons = keyboard.inline_keyboard[0]
+    assert len(buttons) == len(_QUICK_PICK_LABELS["threshold"])
+    assert all(btn.callback_data.startswith("set:qp:threshold:") for btn in buttons)
+
+
+def test_quick_pick_keyboard_budget_has_one_button_per_option():
+    keyboard = _quick_pick_keyboard("budget")
+    assert keyboard is not None
+    buttons = keyboard.inline_keyboard[0]
+    assert len(buttons) == len(_QUICK_PICK_LABELS["budget"])
+    assert all(btn.callback_data.startswith("set:qp:budget:") for btn in buttons)
+
+
+def test_every_quick_pick_key_has_a_label():
+    for setting, options in _QUICK_PICKS.items():
+        labelled_keys = {key for key, _ in _QUICK_PICK_LABELS[setting]}
+        assert set(options.keys()) == labelled_keys
+
+
+def test_quick_pick_changes_are_valid_pipeline_settings_fields():
+    valid_fields = set(PipelineSettings.model_fields.keys())
+    for options in _QUICK_PICKS.values():
+        for changes in options.values():
+            assert set(changes.keys()) <= valid_fields
+
+
+def test_wizard_steps_are_all_promptable():
+    assert set(_WIZARD_STEPS) <= set(_PROMPTABLE_COMMANDS.keys())
+
+
+def test_wizard_steps_have_no_duplicates():
+    assert len(_WIZARD_STEPS) == len(set(_WIZARD_STEPS))
