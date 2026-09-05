@@ -31,6 +31,8 @@ from becarscout.db.models import ListingRow
 from becarscout.feedback_agent import apply_latest_suggestions, run_feedback_review
 from becarscout.feedback_agent.memory import find_similar_feedback, store_feedback_memory
 from becarscout.scoring.models import ScoredListing
+from becarscout.structurer.makes import MAKES
+from becarscout.structurer.parse import FUEL_TYPES, TRANSMISSIONS
 
 from .feedback import record_feedback
 from .formatting import format_opportunity_message, format_score_explanation
@@ -71,6 +73,24 @@ _SETTINGS_PROMPTS: dict[str, str] = {
         "📍 How far should I search around each city?\n"
         "Type a distance in km, like 100."
     ),
+    "mileage": (
+        "🛣️ What's the highest mileage you'll accept?\n"
+        "Type a distance in km, like 150000\n"
+        "Or type off for no limit."
+    ),
+    "make": (
+        "🚘 Any specific brands? Type them separated by commas, like: bmw, toyota\n"
+        f"(some brands I recognize: {', '.join(sorted(MAKES)[:8])}, ...)\n"
+        "Or type off to see any brand."
+    ),
+    "fuel": (
+        f"⛽ Any fuel preference? Type one or more, separated by commas: {', '.join(FUEL_TYPES)}\n"
+        "Or type off for no preference."
+    ),
+    "transmission": (
+        f"🔧 Automatic or manual? Type one: {', '.join(TRANSMISSIONS)}\n"
+        "Or type off for no preference."
+    ),
 }
 
 _WELCOME_TEXT = (
@@ -80,7 +100,8 @@ _WELCOME_TEXT = (
     "💶 your budget\n"
     "📅 the oldest year you'll consider\n"
     "📍 how far I should search\n"
-    "🎯 how picky I should be\n\n"
+    "🎯 how picky I should be\n"
+    "🛣️ 🚘 ⛽ 🔧 and filters for mileage, brand, fuel type, transmission\n\n"
     "Other things I can do:\n"
     "🔎 /find — search right now instead of waiting for the next hour\n"
     "🔍 /search — look through cars I've already found, e.g. /search golf\n"
@@ -237,6 +258,15 @@ def _parse_int_arg(text: str) -> int | None:
         return None
 
 
+def _parse_csv_arg(args: list[str]) -> list[str]:
+    """Joins whitespace-split command args back into one string and splits
+    on commas — lets `/make bmw, toyota` and `/make bmw,toyota` both work,
+    since Telegram already splits args on whitespace before the handler
+    ever sees them."""
+    joined = " ".join(args)
+    return [item.strip().lower() for item in joined.split(",") if item.strip()]
+
+
 def _budget_text(settings) -> str:
     lo = f"€{settings.min_price:,}" if settings.min_price is not None else "€0"
     hi = f"€{settings.max_price:,}" if settings.max_price is not None else "no max"
@@ -259,6 +289,14 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🎯 Threshold", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:threshold"),
                 InlineKeyboardButton("📍 Radius", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:radius"),
             ],
+            [
+                InlineKeyboardButton("🛣️ Mileage", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:mileage"),
+                InlineKeyboardButton("🚘 Brand", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:make"),
+            ],
+            [
+                InlineKeyboardButton("⛽ Fuel", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:fuel"),
+                InlineKeyboardButton("🔧 Transmission", callback_data=f"{SETTINGS_CALLBACK_PREFIX}:transmission"),
+            ],
         ]
     )
 
@@ -274,13 +312,21 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     finally:
         session.close()
     min_year_text = str(settings.min_year) if settings.min_year is not None else "any year"
+    mileage_text = f"{settings.max_mileage_km:,} km" if settings.max_mileage_km is not None else "no limit"
+    makes_text = settings.makes.replace(",", ", ") if settings.makes else "any brand"
+    fuel_text = settings.fuel_types.replace(",", ", ") if settings.fuel_types else "any fuel type"
+    transmission_text = settings.transmission or "no preference"
     await _reply(
         update,
         "⚙️ Your current setup:\n\n"
         f"💶 Budget: {_budget_text(settings)}\n"
         f"📅 Oldest year I'll consider: {min_year_text}\n"
         f"📍 Search area: {settings.radius_km} km around each city\n"
-        f"🎯 How picky I am: {settings.threshold} (higher = fewer, better matches)\n\n"
+        f"🎯 How picky I am: {settings.threshold} (higher = fewer, better matches)\n"
+        f"🛣️ Highest mileage: {mileage_text}\n"
+        f"🚘 Brands: {makes_text}\n"
+        f"⛽ Fuel type: {fuel_text}\n"
+        f"🔧 Transmission: {transmission_text}\n\n"
         "Tap a button below to change one — I'll ask what you want it set to.\n\n"
         "Changes apply from the next search onward (I check hourly, or you can say /find "
         "to make me search right now).",
@@ -431,6 +477,131 @@ async def _cmd_radius(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _reply(update, f"✅ I'll now search {settings.radius_km} km around each city.\nThis applies from your next search onward.")
 
 
+async def _cmd_mileage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/mileage 150000` excludes cars with more km than that regardless
+    of score; `/mileage off` disables the cutoff. A listing with no
+    detected mileage still passes -- see `scoring/gate.py`'s docstring."""
+    args = context.args or []
+    session = get_session()
+    try:
+        if not args:
+            settings = repo.get_pipeline_settings(session)
+            current = f"{settings.max_mileage_km:,} km" if settings.max_mileage_km is not None else "no limit"
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "mileage"
+            await _reply(update, f"Right now, highest mileage I'll accept: {current}\n\n{_SETTINGS_PROMPTS['mileage']}")
+            return
+
+        if args[0].lower() == "off":
+            settings = repo.update_pipeline_settings(session, max_mileage_km=None)
+        else:
+            km = _parse_int_arg(args[0])
+            if km is None or km <= 0:
+                await _reply(update, "That doesn't look like a distance. Try a positive number like 150000.")
+                return
+            settings = repo.update_pipeline_settings(session, max_mileage_km=km)
+    finally:
+        session.close()
+    confirmation = (
+        f"✅ I'll now skip cars with more than {settings.max_mileage_km:,} km."
+        if settings.max_mileage_km is not None
+        else "✅ No mileage limit anymore."
+    )
+    await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+
+
+async def _cmd_make(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/make bmw, toyota` only shows those brands; `/make off` clears
+    it. Unlike /mileage or /minyear, a listing whose brand wasn't
+    detected does *not* pass once this filter is set -- see
+    `scoring/gate.py`'s docstring for why."""
+    args = context.args or []
+    session = get_session()
+    try:
+        if not args:
+            settings = repo.get_pipeline_settings(session)
+            current = settings.makes.replace(",", ", ") if settings.makes else "any brand"
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "make"
+            await _reply(update, f"Right now, brands I'll show you: {current}\n\n{_SETTINGS_PROMPTS['make']}")
+            return
+
+        if args[0].lower() == "off":
+            settings = repo.update_pipeline_settings(session, makes=None)
+        else:
+            wanted = _parse_csv_arg(args)
+            if not wanted:
+                await _reply(update, "I didn't catch a brand there. Try something like: bmw, toyota")
+                return
+            known = {m.lower() for m in MAKES}
+            unknown = [m for m in wanted if m not in known]
+            settings = repo.update_pipeline_settings(session, makes=",".join(wanted))
+            if unknown:
+                await _reply(update, f"⚠️ Heads up, I don't recognize \"{', '.join(unknown)}\" as a brand -- double-check the spelling, or it just won't match anything.")
+    finally:
+        session.close()
+    confirmation = f"✅ I'll only show you: {settings.makes.replace(',', ', ')}" if settings.makes else "✅ I'll show you any brand again."
+    await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+
+
+async def _cmd_fuel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/fuel diesel, hybrid` only shows those fuel types; `/fuel off`
+    clears it. Strict about valid values (unlike /make) since the set of
+    real fuel types is small and fixed -- see `structurer.parse.FUEL_TYPES`."""
+    args = context.args or []
+    session = get_session()
+    try:
+        if not args:
+            settings = repo.get_pipeline_settings(session)
+            current = settings.fuel_types.replace(",", ", ") if settings.fuel_types else "any fuel type"
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "fuel"
+            await _reply(update, f"Right now, fuel types I'll show you: {current}\n\n{_SETTINGS_PROMPTS['fuel']}")
+            return
+
+        if args[0].lower() == "off":
+            settings = repo.update_pipeline_settings(session, fuel_types=None)
+        else:
+            wanted = _parse_csv_arg(args)
+            invalid = [f for f in wanted if f not in FUEL_TYPES]
+            if invalid:
+                await _reply(update, f"I don't recognize \"{', '.join(invalid)}\". Valid options: {', '.join(FUEL_TYPES)}")
+                return
+            settings = repo.update_pipeline_settings(session, fuel_types=",".join(wanted))
+    finally:
+        session.close()
+    confirmation = f"✅ I'll only show you: {settings.fuel_types.replace(',', ', ')}" if settings.fuel_types else "✅ I'll show you any fuel type again."
+    await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+
+
+async def _cmd_transmission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/transmission automatic` or `/transmission manual`; `/transmission
+    off` clears it. Same strict-values reasoning as /fuel."""
+    args = context.args or []
+    session = get_session()
+    try:
+        if not args:
+            settings = repo.get_pipeline_settings(session)
+            current = settings.transmission or "no preference"
+            if update.effective_chat:
+                _pending_prompts[update.effective_chat.id] = "transmission"
+            await _reply(update, f"Right now: {current}\n\n{_SETTINGS_PROMPTS['transmission']}")
+            return
+
+        if args[0].lower() == "off":
+            settings = repo.update_pipeline_settings(session, transmission=None)
+        else:
+            wanted = args[0].strip().lower()
+            if wanted not in TRANSMISSIONS:
+                await _reply(update, f"I don't recognize \"{wanted}\". Valid options: {', '.join(TRANSMISSIONS)}")
+                return
+            settings = repo.update_pipeline_settings(session, transmission=wanted)
+    finally:
+        session.close()
+    confirmation = f"✅ I'll only show you: {settings.transmission}" if settings.transmission else "✅ No preference anymore."
+    await _reply(update, f"{confirmation}\nThis applies from your next search onward.")
+
+
 # Maps a pending-prompt key (see _SETTINGS_PROMPTS) to the same handler its
 # matching /command uses — defined after all four exist so _handle_plain_reply
 # and the /settings buttons can dispatch to them without duplicating logic.
@@ -439,6 +610,10 @@ _PROMPTABLE_COMMANDS = {
     "minyear": _cmd_minyear,
     "threshold": _cmd_threshold,
     "radius": _cmd_radius,
+    "mileage": _cmd_mileage,
+    "make": _cmd_make,
+    "fuel": _cmd_fuel,
+    "transmission": _cmd_transmission,
 }
 
 # `becarscout run`'s log lines carry a timestamp + level prefix (see
@@ -589,6 +764,10 @@ _BOT_COMMANDS = [
     BotCommand("minyear", "Set the oldest year you'll consider"),
     BotCommand("threshold", "Set how picky I should be"),
     BotCommand("radius", "Set how far I should search"),
+    BotCommand("mileage", "Set the highest mileage you'll accept"),
+    BotCommand("make", "Only show certain brands, e.g. bmw, toyota"),
+    BotCommand("fuel", "Only show certain fuel types, e.g. diesel"),
+    BotCommand("transmission", "Only show automatic or manual"),
     BotCommand("reviewfeedback", "See patterns in the cars you liked/disliked"),
     BotCommand("validate", "Apply what the last review suggested"),
     BotCommand("help", "Show this list again"),
@@ -631,6 +810,10 @@ def run_feedback_listener() -> None:
     application.add_handler(CommandHandler("minyear", _cmd_minyear))
     application.add_handler(CommandHandler("threshold", _cmd_threshold))
     application.add_handler(CommandHandler("radius", _cmd_radius))
+    application.add_handler(CommandHandler("mileage", _cmd_mileage))
+    application.add_handler(CommandHandler("make", _cmd_make))
+    application.add_handler(CommandHandler("fuel", _cmd_fuel))
+    application.add_handler(CommandHandler("transmission", _cmd_transmission))
     application.add_handler(CommandHandler("reviewfeedback", _cmd_reviewfeedback))
     application.add_handler(CommandHandler("validate", _cmd_validate))
     # Must be added after every CommandHandler above -- filters.COMMAND

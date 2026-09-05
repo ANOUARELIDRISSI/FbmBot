@@ -353,6 +353,10 @@ def get_pipeline_settings(session: Session) -> PipelineSettings:
         max_price=row.max_price,
         min_year=row.min_year,
         threshold=row.threshold if row.threshold is not None else PipelineSettings().threshold,
+        max_mileage_km=row.max_mileage_km,
+        makes=row.makes,
+        fuel_types=row.fuel_types,
+        transmission=row.transmission,
     )
 
 
@@ -374,6 +378,10 @@ def update_pipeline_settings(session: Session, **changes: object) -> PipelineSet
             max_price=current.max_price,
             min_year=current.min_year,
             threshold=current.threshold,
+            max_mileage_km=current.max_mileage_km,
+            makes=current.makes,
+            fuel_types=current.fuel_types,
+            transmission=current.transmission,
         )
         session.add(row)
     for key, value in changes.items():

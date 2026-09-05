@@ -91,6 +91,14 @@ class PipelineSettingsRow(Base):
     max_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
     min_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     threshold: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_mileage_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    makes: Mapped[str | None] = mapped_column(String, nullable=True)
+    fuel_types: Mapped[str | None] = mapped_column(String, nullable=True)
+    transmission: Mapped[str | None] = mapped_column(String, nullable=True)
+    """These four added after the table's first deployment -- see
+    `db/engine.py`'s `_ensure_column` calls for how they get added to an
+    already-populated DB (a plain `create_all` alone only creates missing
+    tables, never adds columns to one that already exists)."""
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 

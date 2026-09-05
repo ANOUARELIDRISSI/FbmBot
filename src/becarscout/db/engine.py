@@ -51,6 +51,10 @@ def _ensure_initialized() -> None:
     event.listens_for(_engine, "connect")(_set_sqlite_pragma)
     Base.metadata.create_all(bind=_engine)
     _ensure_column(_engine, "listings", "condition_highlights_json", "TEXT DEFAULT '[]'")
+    _ensure_column(_engine, "pipeline_settings", "max_mileage_km", "INTEGER")
+    _ensure_column(_engine, "pipeline_settings", "makes", "TEXT")
+    _ensure_column(_engine, "pipeline_settings", "fuel_types", "TEXT")
+    _ensure_column(_engine, "pipeline_settings", "transmission", "TEXT")
     _SessionLocal = sessionmaker(bind=_engine)
 
 

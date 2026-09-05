@@ -49,6 +49,14 @@ _TRANSMISSION_KEYWORDS: list[tuple[str, list[str]]] = [
     ("manual", ["manuelle", "manuele", "manueel", "manual", "handgeschakeld"]),
 ]
 
+FUEL_TYPES: list[str] = [label for label, _ in _FUEL_KEYWORDS]
+"""The exact normalized labels `parse_fuel_type` can return -- exported so
+callers validating user input (e.g. Telegram's `/fuel` filter) can check
+against the real set instead of duplicating it."""
+
+TRANSMISSIONS: list[str] = [label for label, _ in _TRANSMISSION_KEYWORDS]
+"""Same idea as `FUEL_TYPES`, for `parse_transmission`'s labels."""
+
 _AGE_UNIT_DAYS = {"minute": 0, "hour": 0, "day": 1, "week": 7, "month": 30, "year": 365}
 _AGE_RELATIVE_RE = re.compile(r"\b(a|an|\d+)\s+(minute|hour|day|week|month|year)s?\s+ago\b")
 

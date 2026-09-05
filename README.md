@@ -80,10 +80,13 @@ re-notifies it — a pure description edit with no price change isn't detectable
 (would need revisiting every known listing's page every run). Useful `scrape` flags:
 `--radius-km`, `--min-price`/`--max-price`, `--max-scrolls`, `--no-details` (skip detail
 pages, faster/less data), `--headed` (visible browser, for debugging selectors). `score`
-takes `--threshold` (default 20) and `--min-year` (default 2010 — cars from that year or
-older never clear the gate regardless of score; `--no-min-year` disables it). `analyze`
-takes `--model` (default `ministral-8b-latest`) and `--delay` (seconds between API calls,
-default 1.0).
+takes `--threshold` (default 20), `--min-year` (default 2010 — cars from that year or
+older never clear the gate regardless of score; `--no-min-year` disables it),
+`--max-mileage-km`, `--makes` (comma-separated, e.g. `bmw,toyota`), `--fuel-types`
+(comma-separated, e.g. `diesel,hybrid`), and `--transmission` (`automatic` or `manual`) —
+all four default to whatever's currently set via `/mileage`/`/make`/`/fuel`/`/transmission`
+on Telegram. `analyze` takes `--model` (default `ministral-8b-latest`) and `--delay`
+(seconds between API calls, default 1.0).
 
 ```bash
 uv run becarscout rescore     # queue every scored listing for re-evaluation with current code
@@ -121,23 +124,32 @@ pipeline jargon) — anyone can use this without knowing how it works internally
   messages again with a summary once the run finishes (can take a few minutes).
 - `/search <keyword>` — looks through listings already scraped for a make/model/title
   match, e.g. `/search golf`. Doesn't scrape anything new — see `/find` for that.
-- `/settings` — shows the current radius, budget, min year, and score threshold at once,
-  with buttons to change any of them.
+- `/settings` — shows every filter below at once, with buttons to change any of them.
 - `/budget <max>`, `/budget <min> <max>`, or `/budget off` — the price range future scrapes
   search within.
 - `/minyear <year>` or `/minyear off` — cars from that year or older never reach Telegram,
   regardless of score (default 2010).
 - `/threshold <n>` — the minimum score a listing needs to reach Telegram.
 - `/radius <km>` — search radius around each Belgian hub city.
+- `/mileage <km>` or `/mileage off` — cars with more mileage than that never reach Telegram,
+  regardless of score.
+- `/make <brand, brand, ...>` or `/make off` — only show specific brands, e.g. `/make bmw,
+  toyota`. Unlike the filters above, a listing whose brand wasn't detected does *not* pass
+  once this is set (see `scoring/gate.py`'s docstring for why that's a deliberate
+  difference).
+- `/fuel <type, type, ...>` or `/fuel off` — only show specific fuel types (`electric`,
+  `hybrid`, `lpg`, `diesel`, `petrol`).
+- `/transmission <automatic|manual>` or `/transmission off` — only show one gearbox type.
 - `/reviewfeedback` — runs stage 7's review agent over your accumulated 👍/👎 and posts the
   patterns + suggested scoring weight changes it found.
 - `/validate` — applies the *last* `/reviewfeedback`'s suggestions for real. This is the
   only command that changes scoring behavior; everything else in stage 7 is advisory until
   you send this. Nothing is applied automatically, ever.
 
-`/budget`, `/minyear`, `/threshold`, and `/radius` also work as a two-step prompt: send the
-command with no arguments (or tap its button under `/settings`) and the bot asks for the
-value, then applies whatever you type next — no need to remember the exact argument syntax.
+`/budget`, `/minyear`, `/threshold`, `/radius`, `/mileage`, `/make`, `/fuel`, and
+`/transmission` all also work as a two-step prompt: send the command with no arguments (or
+tap its button under `/settings`) and the bot asks for the value, then applies whatever you
+type next — no need to remember the exact argument syntax.
 
 Every setting above takes effect from the *next* scrape/score run onward — cron always
 invokes `becarscout run` with no flags, and it resolves each parameter as

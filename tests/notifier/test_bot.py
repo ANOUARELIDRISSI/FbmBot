@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from becarscout.db.models import ListingRow
-from becarscout.notifier.bot import _budget_text, _format_search_hit, _parse_int_arg, _summarize_find_output
+from becarscout.notifier.bot import _budget_text, _format_search_hit, _parse_csv_arg, _parse_int_arg, _summarize_find_output
 from becarscout.settings import PipelineSettings
 
 
@@ -33,6 +33,22 @@ def test_budget_text_full_range():
     text = _budget_text(PipelineSettings(min_price=3000, max_price=12000))
     assert "€3,000" in text
     assert "€12,000" in text
+
+
+def test_parse_csv_arg_handles_comma_with_no_spaces():
+    assert _parse_csv_arg(["bmw,toyota"]) == ["bmw", "toyota"]
+
+
+def test_parse_csv_arg_handles_comma_with_spaces_split_across_args():
+    assert _parse_csv_arg(["bmw,", "toyota"]) == ["bmw", "toyota"]
+
+
+def test_parse_csv_arg_lowercases_and_strips():
+    assert _parse_csv_arg(["BMW", " , ", "Land Rover"]) == ["bmw", "land rover"]
+
+
+def test_parse_csv_arg_empty_input():
+    assert _parse_csv_arg([]) == []
 
 
 def _make_row(**overrides) -> ListingRow:

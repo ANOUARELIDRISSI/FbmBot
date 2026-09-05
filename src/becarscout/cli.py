@@ -91,7 +91,15 @@ def do_analyze(*, model: str = DEFAULT_MODEL, delay: float = 1.0) -> tuple[int, 
         session.close()
 
 
-async def do_score(*, threshold: int = DEFAULT_THRESHOLD, min_year: int | None = DEFAULT_MIN_YEAR) -> tuple[int, int]:
+async def do_score(
+    *,
+    threshold: int = DEFAULT_THRESHOLD,
+    min_year: int | None = DEFAULT_MIN_YEAR,
+    max_mileage_km: int | None = None,
+    makes: str | None = None,
+    fuel_types: str | None = None,
+    transmission: str | None = None,
+) -> tuple[int, int]:
     session = get_session()
     try:
         pending = repo.get_listings_needing_scoring(session)
@@ -101,7 +109,15 @@ async def do_score(*, threshold: int = DEFAULT_THRESHOLD, min_year: int | None =
         signals_by_id = {s.listing_id: sig for s, sig in pending if sig is not None}
         weights = repo.get_scoring_weights(session)
         scored = await score_listings(structured_listings, signals_by_id, weights)
-        scored = apply_decision_gate(scored, threshold=threshold, min_year=min_year)
+        scored = apply_decision_gate(
+            scored,
+            threshold=threshold,
+            min_year=min_year,
+            max_mileage_km=max_mileage_km,
+            makes=makes,
+            fuel_types=fuel_types,
+            transmission=transmission,
+        )
         repo.save_scores(session, scored)
         opportunities = sum(1 for s in scored if s.above_threshold)
         return len(scored), opportunities
@@ -133,6 +149,10 @@ async def run_full_pipeline(
     delay: float = 1.0,
     threshold: int = DEFAULT_THRESHOLD,
     min_year: int | None = DEFAULT_MIN_YEAR,
+    max_mileage_km: int | None = None,
+    makes: str | None = None,
+    fuel_types: str | None = None,
+    transmission: str | None = None,
     headless: bool = True,
 ) -> None:
     """Runs every stage in sequence — used by `becarscout run` (and cron).
@@ -162,7 +182,10 @@ async def run_full_pipeline(
         logger.exception("analyze stage failed")
 
     try:
-        scored_count, opportunity_count = await do_score(threshold=threshold, min_year=min_year)
+        scored_count, opportunity_count = await do_score(
+            threshold=threshold, min_year=min_year, max_mileage_km=max_mileage_km,
+            makes=makes, fuel_types=fuel_types, transmission=transmission,
+        )
         logger.info("score: %d listings (%d opportunities)", scored_count, opportunity_count)
     except Exception:
         logger.exception("score stage failed")
@@ -223,7 +246,16 @@ def _cmd_score(args: argparse.Namespace) -> None:
     settings = _current_settings()
     min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
     threshold = args.threshold if args.threshold is not None else settings.threshold
-    count, opportunities = asyncio.run(do_score(threshold=threshold, min_year=min_year))
+    max_mileage_km = args.max_mileage_km if args.max_mileage_km is not None else settings.max_mileage_km
+    makes = args.makes if args.makes is not None else settings.makes
+    fuel_types = args.fuel_types if args.fuel_types is not None else settings.fuel_types
+    transmission = args.transmission if args.transmission is not None else settings.transmission
+    count, opportunities = asyncio.run(
+        do_score(
+            threshold=threshold, min_year=min_year, max_mileage_km=max_mileage_km,
+            makes=makes, fuel_types=fuel_types, transmission=transmission,
+        )
+    )
     year_note = f", newer than {min_year}" if min_year is not None else ""
     print(f"Scored {count} listings ({opportunities} above threshold {threshold}{year_note})")
 
@@ -282,8 +314,9 @@ def _cmd_whoami(_args: argparse.Namespace) -> None:
 def _cmd_run(args: argparse.Namespace) -> None:
     # cron invokes this with zero flags every time, so this is the one
     # place where the Telegram-set settings (/budget, /minyear,
-    # /threshold, /radius) actually take effect hour to hour — an
-    # explicit CLI flag still wins if one is given.
+    # /threshold, /radius, /mileage, /make, /fuel, /transmission) actually
+    # take effect hour to hour — an explicit CLI flag still wins if one is
+    # given.
     settings = _current_settings()
     min_year = None if args.no_min_year else (args.min_year if args.min_year is not None else settings.min_year)
     asyncio.run(
@@ -296,6 +329,10 @@ def _cmd_run(args: argparse.Namespace) -> None:
             delay=args.delay,
             threshold=args.threshold if args.threshold is not None else settings.threshold,
             min_year=min_year,
+            max_mileage_km=args.max_mileage_km if args.max_mileage_km is not None else settings.max_mileage_km,
+            makes=args.makes if args.makes is not None else settings.makes,
+            fuel_types=args.fuel_types if args.fuel_types is not None else settings.fuel_types,
+            transmission=args.transmission if args.transmission is not None else settings.transmission,
             headless=not args.headed,
         )
     )
@@ -348,6 +385,10 @@ def main() -> None:
     score_parser.add_argument("--threshold", type=int, default=None, help=f"Default: current /threshold setting ({DEFAULT_THRESHOLD} if never changed)")
     score_parser.add_argument("--min-year", type=int, default=None, help=f"Default: current /minyear setting ({DEFAULT_MIN_YEAR} if never changed)")
     score_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
+    score_parser.add_argument("--max-mileage-km", type=int, default=None, help="Default: current /mileage setting (no limit if never changed)")
+    score_parser.add_argument("--makes", default=None, help="Comma-separated, e.g. bmw,toyota. Default: current /make setting")
+    score_parser.add_argument("--fuel-types", default=None, help="Comma-separated, e.g. diesel,hybrid. Default: current /fuel setting")
+    score_parser.add_argument("--transmission", default=None, help="automatic or manual. Default: current /transmission setting")
     score_parser.set_defaults(func=_cmd_score)
 
     notify_parser = subparsers.add_parser(
@@ -389,6 +430,10 @@ def main() -> None:
     run_parser.add_argument("--threshold", type=int, default=None, help="Default: current /threshold setting")
     run_parser.add_argument("--min-year", type=int, default=None, help="Default: current /minyear setting")
     run_parser.add_argument("--no-min-year", action="store_true", help="Disable the year cutoff entirely")
+    run_parser.add_argument("--max-mileage-km", type=int, default=None, help="Default: current /mileage setting")
+    run_parser.add_argument("--makes", default=None, help="Comma-separated, e.g. bmw,toyota. Default: current /make setting")
+    run_parser.add_argument("--fuel-types", default=None, help="Comma-separated, e.g. diesel,hybrid. Default: current /fuel setting")
+    run_parser.add_argument("--transmission", default=None, help="automatic or manual. Default: current /transmission setting")
     run_parser.add_argument("--headed", action="store_true")
     run_parser.set_defaults(func=_cmd_run)
 

@@ -152,6 +152,37 @@ def test_update_pipeline_settings_budget_range(session):
     assert (settings.min_price, settings.max_price) == (3000, 12000)
 
 
+def test_get_pipeline_settings_defaults_for_new_filters(session):
+    settings = repo.get_pipeline_settings(session)
+    assert settings.max_mileage_km is None
+    assert settings.makes is None
+    assert settings.fuel_types is None
+    assert settings.transmission is None
+
+
+def test_update_pipeline_settings_new_filters_partial_update(session):
+    repo.update_pipeline_settings(session, max_mileage_km=150_000)
+    repo.update_pipeline_settings(session, makes="bmw,toyota")
+    repo.update_pipeline_settings(session, fuel_types="diesel")
+    repo.update_pipeline_settings(session, transmission="automatic")
+
+    settings = repo.get_pipeline_settings(session)
+    assert settings.max_mileage_km == 150_000
+    assert settings.makes == "bmw,toyota"
+    assert settings.fuel_types == "diesel"
+    assert settings.transmission == "automatic"
+    assert settings.radius_km == 100  # untouched, still the default
+
+
+def test_update_pipeline_settings_can_clear_new_filters(session):
+    repo.update_pipeline_settings(session, makes="bmw", max_mileage_km=100_000)
+    repo.update_pipeline_settings(session, makes=None, max_mileage_km=None)
+
+    settings = repo.get_pipeline_settings(session)
+    assert settings.makes is None
+    assert settings.max_mileage_km is None
+
+
 # --- scoring weights (/validate) ---
 
 
