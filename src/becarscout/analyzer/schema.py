@@ -30,6 +30,8 @@ SIGNALS_JSON_SCHEMA: dict = {
         "fuel_type": {"type": ["string", "null"], "enum": ["diesel", "petrol", "hybrid", "electric", "lpg", None]},
         "transmission": {"type": ["string", "null"], "enum": ["manual", "automatic", None]},
         "mileage_km": {"type": ["integer", "null"]},
+        "make": {"type": ["string", "null"]},
+        "model": {"type": ["string", "null"]},
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
     },
     "required": [
@@ -37,7 +39,7 @@ SIGNALS_JSON_SCHEMA: dict = {
         "gearbox_issue", "gearbox_issue_severity", "engine_issue", "engine_issue_severity",
         "accident_damage", "timing_belt_replaced", "is_whole_vehicle", "inspection_valid",
         "service_history", "vat_scheme", "for_export", "fuel_type", "transmission",
-        "mileage_km", "confidence",
+        "mileage_km", "make", "model", "confidence",
     ],
     "additionalProperties": False,
 }
@@ -73,6 +75,11 @@ explicit normal invoice/BTW aftrekbaar -> normal; not mentioned -> unknown
 - fuel_type, transmission, mileage_km: only set if explicitly mentioned in the \
 description — used to cross-check separate regex-based extraction, not to \
 replace it
+- make, model: the manufacturer's real name and the model name (e.g. "Volkswagen" / \
+"Golf", "Jeep" / "Grand Cherokee" — include multi-word model names in full, don't \
+truncate to one word). Only set if clearly identifiable from the title or \
+description; used as a fallback for a separate regex-based detector that misses \
+many listings, not a replacement for it.
 - confidence: your confidence in how complete/clear this description was to \
 extract from (high/medium/low) — not a judgment of the car
 

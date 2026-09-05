@@ -55,6 +55,17 @@ class DescriptionSignalFields(BaseModel):
     """Only set if explicitly mentioned in the description — cross-checks
     stage 2's regex-based extraction rather than replacing it."""
 
+    make: str | None = None
+    """Only set if clearly identifiable from the title/description — the
+    manufacturer's real name (e.g. "Volkswagen", not "VW"). Stage 2's
+    regex-based make detection misses ~64% of listings (Project.md); this
+    is a fallback the scoring stage uses only when stage 2 found nothing,
+    never a replacement for it."""
+    model: str | None = None
+    """Only set if clearly identifiable — same fallback role as `make`,
+    for stage 2's `model_hint`. Prefer the full model name including
+    multi-word ones (e.g. "Grand Cherokee", not just "Grand")."""
+
     confidence: Literal["high", "medium", "low"] = "medium"
     """Confidence in how complete/clear the description was to extract
     from — not a judgment of the car itself."""

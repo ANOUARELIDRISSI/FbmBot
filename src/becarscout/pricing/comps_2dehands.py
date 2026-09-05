@@ -187,3 +187,37 @@ async def get_comps_cached(
         json.dumps([c.model_dump(mode="json") for c in comps], ensure_ascii=False), encoding="utf-8"
     )
     return comps
+
+
+_CANARY_MAKE = "Volkswagen"
+_CANARY_MODEL = "Golf"
+_MIN_CANARY_RESULTS = 3
+"""Golf is one of the most commonly listed used cars in Belgium — if a
+live search for it ever returns fewer than this many results, 2dehands.be's
+markup almost certainly changed (our selectors stopped matching), not that
+Golfs stopped being sold. See `check_comps_source_health`."""
+
+
+async def check_comps_source_health(browser: Browser | None = None) -> bool:
+    """Cheap sanity check for the whole comps pipeline: fetches the canary
+    make/model directly via `fetch_comps` (bypassing `get_comps_cached`
+    deliberately — a live check catches a real markup break the run it
+    happens, instead of that break being masked for up to 7 days by an
+    already-cached, still-fresh result from before the site changed).
+    Returns False on any failure to fetch, or too few results — either way
+    means every listing's price baseline this run is suspect."""
+    try:
+        comps = await fetch_comps(_CANARY_MAKE, _CANARY_MODEL, max_results=10, browser=browser)
+    except Exception:
+        logger.exception("Comps-source health check failed to even run")
+        return False
+
+    healthy = len(comps) >= _MIN_CANARY_RESULTS
+    if not healthy:
+        logger.error(
+            "Comps-source health check FAILED: only %d result(s) for %s %s "
+            "(expected >= %d). 2dehands.be's markup may have changed, "
+            "silently breaking price baselines for every listing this run.",
+            len(comps), _CANARY_MAKE, _CANARY_MODEL, _MIN_CANARY_RESULTS,
+        )
+    return healthy
