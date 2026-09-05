@@ -79,3 +79,24 @@ def test_score_explanation_contains_the_full_reasoning_trail():
 def test_score_explanation_handles_no_reasoning():
     explanation = format_score_explanation(_listing(reasoning=[]))
     assert "No detailed reasoning available." in explanation
+
+
+def test_titles_with_markdown_special_characters_pass_through_unescaped():
+    # Real bug found live: a seller's own title containing "*130.000 km*"
+    # broke Telegram's legacy Markdown parser (BadRequest: Can't parse
+    # entities) even after escaping -- an escaped closing "\*" landing
+    # right next to the wrapping bold marker's own "*" is a fragile edge
+    # case in that parser. Messages are plain text now (no parse_mode),
+    # so the title must come through completely untouched -- no escaping,
+    # no crash, no dropped characters.
+    title = "Citroen jumper l2h2 2.0 hdi 2016 euro 6b ct ok carpass *130.000 km*"
+    message = format_opportunity_message(_listing(raw_title=title))
+    assert title in message
+    assert "\\*" not in message
+
+
+def test_score_explanation_also_passes_special_characters_through_unescaped():
+    title = "Underscore_title [with] brackets and `backticks`"
+    explanation = format_score_explanation(_listing(raw_title=title))
+    assert title in explanation
+    assert "\\" not in explanation

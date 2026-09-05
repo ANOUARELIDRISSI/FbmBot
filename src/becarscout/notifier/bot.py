@@ -112,7 +112,6 @@ async def send_new_opportunities(opportunities: list[ScoredListing]) -> list[str
                         await bot.send_message(
                             chat_id=chat_id,
                             text=format_opportunity_message(listing, similar_feedback),
-                            parse_mode="Markdown",
                             reply_markup=_keyboard(listing.listing_id),
                         )
                         sent_ids.append(listing.listing_id)
@@ -153,7 +152,7 @@ async def _handle_feedback_callback(update: Update, _context: ContextTypes.DEFAU
         scored = _fetch_scored_listing(listing_id)
         if scored is not None and query.message:
             try:
-                await query.message.reply_text(format_score_explanation(scored), parse_mode="Markdown")
+                await query.message.reply_text(format_score_explanation(scored))
             except Exception:
                 logger.exception("Failed to send score explanation for %s", listing_id)
         return
