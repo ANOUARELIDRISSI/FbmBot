@@ -183,6 +183,13 @@ one radius has to define what gets scraped for everyone; see Project.md).
 - `/fuel <type, type, ...>` or `/fuel off` — only show specific fuel types (`electric`,
   `hybrid`, `lpg`, `diesel`, `petrol`).
 - `/transmission <automatic|manual>` or `/transmission off` — only show one gearbox type.
+- `/weights` (also `/showall`) — lists every point value the scoring engine adds or
+  subtracts for a condition signal (gearbox/engine issues, accident damage, warning lights,
+  timing belt, inspection, service history, export listings, the minimum plausible car
+  price), personal to you, with a button to hand-adjust each one directly. Same numbers
+  `/validate` can change from an approved feedback review — this is the manual, anytime
+  version of the same control, so you can tune the scoring engine yourself as you see which
+  signals matter to you.
 - `/reviewfeedback` — runs stage 7's review agent over your accumulated 👍/👎 and posts the
   patterns + suggested scoring weight changes it found.
 - `/validate` — applies the *last* `/reviewfeedback`'s suggestions for real. This is the
@@ -198,6 +205,12 @@ typing a number is optional. Invalid input (a typo, an out-of-range value) leave
 prompt armed rather than silently giving up — just send another try, or `/cancel` to back
 out entirely. Any other unhandled error is caught by a bot-wide error handler that tells you
 something went wrong instead of just going silent.
+
+Every command above also works without the leading `/` — plain `settings`, `budget 15000`,
+or `weights` do exactly the same thing as their slash form. A command word typed as plain
+text always wins over a pending prompt (so typing `cancel` while `/budget` is waiting for a
+number cancels it, rather than being read as an invalid budget value) — same as sending the
+real slash command already does.
 
 Every setting above takes effect from the *next* search onward — cron runs the shared
 scrape/structure/analyze/baseline stages once per hour, then scores and notifies every

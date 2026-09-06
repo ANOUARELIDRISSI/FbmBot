@@ -8,8 +8,13 @@ from becarscout.notifier.bot import (
     _QUICK_PICK_LABELS,
     _QUICK_PICKS,
     _SEARCH_RANGE_DAYS,
+    _TEXT_COMMANDS,
+    _WEIGHT_LABELS,
     _WIZARD_STEPS,
     _budget_text,
+    _cmd_budget,
+    _cmd_settings,
+    _cmd_weights,
     _format_search_hit,
     _parse_csv_arg,
     _parse_int_arg,
@@ -17,9 +22,11 @@ from becarscout.notifier.bot import (
     _quick_pick_keyboard,
     _search_range_keyboard,
     _summarize_find_output,
+    _weight_value_text,
+    _weights_keyboard,
     _welcome_text,
 )
-from becarscout.scoring.models import ScoredListing
+from becarscout.scoring.models import ScoredListing, ScoringWeights
 from becarscout.settings import PipelineSettings
 
 
@@ -208,3 +215,39 @@ def test_welcome_text_falls_back_to_generic_greeting():
 
 def test_name_is_promptable():
     assert "name" in _PROMPTABLE_COMMANDS
+
+
+def test_weight_labels_match_scoring_weights_fields_exactly():
+    assert set(_WEIGHT_LABELS.keys()) == set(ScoringWeights.model_fields.keys())
+
+
+def test_weight_value_text_formats_price_field_as_currency():
+    assert _weight_value_text("min_plausible_car_price_eur", 300) == "€300"
+
+
+def test_weight_value_text_formats_point_fields_with_sign():
+    assert _weight_value_text("accident_damage", -25) == "-25 pts"
+    assert _weight_value_text("timing_belt_replaced", 12) == "+12 pts"
+
+
+def test_weights_keyboard_has_one_button_per_weight_field():
+    keyboard = _weights_keyboard()
+    assert len(keyboard.inline_keyboard) == len(_WEIGHT_LABELS)
+    all_callback_data = [row[0].callback_data for row in keyboard.inline_keyboard]
+    assert all(cd.startswith("set:wt:") for cd in all_callback_data)
+    fields = {cd.split(":", 2)[2] for cd in all_callback_data}
+    assert fields == set(_WEIGHT_LABELS.keys())
+
+
+def test_text_commands_covers_every_promptable_command():
+    assert set(_PROMPTABLE_COMMANDS.keys()) <= set(_TEXT_COMMANDS.keys())
+
+
+def test_text_commands_includes_weights_and_its_showall_alias():
+    assert _TEXT_COMMANDS["weights"] is _cmd_weights
+    assert _TEXT_COMMANDS["showall"] is _cmd_weights
+
+
+def test_text_commands_maps_plain_words_to_the_same_handlers_as_their_slash_command():
+    assert _TEXT_COMMANDS["settings"] is _cmd_settings
+    assert _TEXT_COMMANDS["budget"] is _cmd_budget

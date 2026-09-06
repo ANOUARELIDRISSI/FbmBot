@@ -42,7 +42,7 @@ from becarscout.db import repository as repo
 from becarscout.db.models import ListingRow
 from becarscout.feedback_agent import apply_latest_suggestions, run_feedback_review
 from becarscout.feedback_agent.memory import find_similar_feedback, store_feedback_memory
-from becarscout.scoring.models import ScoredListing
+from becarscout.scoring.models import ScoredListing, ScoringWeights
 from becarscout.structurer.makes import MAKES
 from becarscout.structurer.parse import FUEL_TYPES, TRANSMISSIONS
 
@@ -98,6 +98,32 @@ _QUICK_PICKS: dict[str, dict[str, dict[str, object]]] = {
 _QUICK_PICK_LABELS: dict[str, list[tuple[str, str]]] = {
     "threshold": [("loose", "😌 Loose"), ("balanced", "⚖️ Balanced"), ("strict", "🔥 Strict")],
     "budget": [("under5k", "Under €5,000"), ("5to15k", "€5,000-15,000"), ("15kplus", "€15,000+")],
+}
+
+_WEIGHT_PROMPT_PREFIX = "wt"
+
+# Field name (matches ScoringWeights/ScoringWeightsRow exactly) -> human label
+# shown by /weights (also /showall) and used as that field's button text --
+# lets a subscriber see and hand-adjust every condition-signal point value
+# the scoring engine uses for them, the same numbers /validate can change
+# from an approved feedback review, but changeable directly and anytime.
+_WEIGHT_LABELS: dict[str, str] = {
+    "gearbox_issue_likely_major": "🔧 Gearbox issue (major)",
+    "gearbox_issue_minor": "🔧 Gearbox issue (minor)",
+    "gearbox_issue_unknown": "🔧 Gearbox issue (severity unclear)",
+    "engine_issue_likely_major": "🔧 Engine issue (major)",
+    "engine_issue_minor": "🔧 Engine issue (minor)",
+    "engine_issue_unknown": "🔧 Engine issue (severity unclear)",
+    "accident_damage": "💥 Accident/body damage mentioned",
+    "warning_light_needs_diagnostic": "⚠️ Warning light, needs diagnostic",
+    "warning_light_only": "⚠️ Warning light mentioned",
+    "timing_belt_replaced": "✅ Timing belt replaced",
+    "inspection_valid": "✅ Inspection (keuring) valid",
+    "inspection_invalid": "❌ Inspection (keuring) not valid",
+    "service_history_complete": "✅ Complete service history",
+    "service_history_none": "❌ No service history",
+    "for_export": "📦 Listed for export",
+    "min_plausible_car_price_eur": "💶 Min plausible car price",
 }
 
 _SEARCH_RANGE_DAYS: dict[str, int] = {"today": 1, "2days": 2, "3days": 3, "week": 7}
@@ -167,10 +193,12 @@ def _welcome_text(name: str | None) -> str:
         "Other things I can do:\n"
         "🔎 /find — search right now instead of waiting for the next hour\n"
         "🔍 /search — look through cars I've already found, e.g. /search golf or /search today\n"
+        "📊 /weights — see and hand-adjust exactly how many points each condition signal is worth\n"
         "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
         "so I get better at picking cars for you over time\n"
         "🚫 /cancel — stop whatever it's currently asking you\n\n"
-        "Type /settings anytime to see your current setup."
+        "Type /settings anytime to see your current setup. "
+        "By the way, you don't need the \"/\" — plain words like settings or budget 15000 work too."
     )
 
 # python-telegram-bot's defaults (5s connect/read, 1s pool timeout) are too
@@ -371,6 +399,19 @@ def _quick_pick_keyboard(setting: str) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup([buttons])
 
 
+def _weight_value_text(field: str, value: int) -> str:
+    return f"€{value:,}" if field == "min_plausible_car_price_eur" else f"{value:+d} pts"
+
+
+def _weights_keyboard() -> InlineKeyboardMarkup:
+    """One button per scoring field -- a long list (16 fields), but each
+    one needs its own full label to be legible, so unlike `_settings_keyboard`
+    this doesn't pack two per row."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"{SETTINGS_CALLBACK_PREFIX}:wt:{field}")] for field, label in _WEIGHT_LABELS.items()]
+    )
+
+
 def _search_range_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(label, callback_data=f"{SETTINGS_CALLBACK_PREFIX}:sr:{key}")
@@ -441,7 +482,8 @@ async def _cmd_settings(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
         f"🔧 Transmission: {transmission_text}\n\n"
         "Tap a button below to change one — I'll ask what you want it set to.\n\n"
         "Changes apply from the next search onward (I check hourly, or you can say /find "
-        "to make me search right now).",
+        "to make me search right now).\n\n"
+        "Looking to change how I score cars, not just filter them? See /weights.",
         reply_markup=_settings_keyboard(),
     )
 
@@ -516,6 +558,48 @@ async def _handle_search_range(update: Update, context: ContextTypes.DEFAULT_TYP
     await _cmd_search(update, context)
 
 
+async def _handle_weight_button(update: Update, field: str) -> None:
+    """Handles a tap on one of `/weights`'s per-signal buttons -- prompts
+    for a new point value the same way a `/budget`-style setting does,
+    keyed by a `wt:<field>` pending-prompt (see `_handle_plain_reply`)
+    instead of a plain setting name, since there are 16 of these instead
+    of one slot per command."""
+    chat = update.effective_chat
+    if not chat or field not in _WEIGHT_LABELS:
+        return
+    session = get_session()
+    try:
+        weights = repo.get_scoring_weights(session, chat.id)
+    finally:
+        session.close()
+    _pending_prompts[chat.id] = f"{_WEIGHT_PROMPT_PREFIX}:{field}"
+    current = _weight_value_text(field, getattr(weights, field))
+    await _reply(
+        update,
+        f"{_WEIGHT_LABELS[field]}\nCurrently: {current}\n\n"
+        "Type the new number -- points can be negative, e.g. -30.",
+    )
+
+
+async def _handle_weight_reply(update: Update, chat_id: int, field: str) -> None:
+    text = update.message.text.strip() if update.message and update.message.text else ""
+    value = _parse_int_arg(text)
+    if value is None:
+        await _reply(update, "That doesn't look like a number -- try again, e.g. -30.")
+        return
+    session = get_session()
+    try:
+        weights = repo.update_scoring_weights(session, chat_id, **{field: value})
+    finally:
+        session.close()
+    _pending_prompts.pop(chat_id, None)
+    await _reply(
+        update,
+        f"✅ {_WEIGHT_LABELS[field]} is now {_weight_value_text(field, getattr(weights, field))}.\n"
+        "This applies from your next search onward.",
+    )
+
+
 async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles taps on the `/settings` buttons — routes to the same
     handler its matching /command uses, so there's one place that owns
@@ -532,6 +616,10 @@ async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAUL
 
     if len(parts) == 3 and parts[1] == "sr":
         await _handle_search_range(update, context, parts[2])
+        return
+
+    if len(parts) == 3 and parts[1] == "wt":
+        await _handle_weight_button(update, parts[2])
         return
 
     if len(parts) != 2:
@@ -576,6 +664,9 @@ async def _handle_plain_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not chat or chat.id not in _pending_prompts or not update.message or not update.message.text:
         return
     setting = _pending_prompts[chat.id]
+    if setting.startswith(f"{_WEIGHT_PROMPT_PREFIX}:"):
+        await _handle_weight_reply(update, chat.id, setting.split(":", 1)[1])
+        return
     handler = _PROMPTABLE_COMMANDS.get(setting)
     if handler is None:
         _pending_prompts.pop(chat.id, None)
@@ -1126,6 +1217,30 @@ async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
     await _reply(update, "\n".join(lines))
 
 
+async def _cmd_weights(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/weights` (also `/showall`) -- lists every point value the scoring
+    engine adds or subtracts for a condition signal, personal to this
+    subscriber, with a button to change each one directly. These are the
+    same numbers /validate can change from an approved feedback review --
+    this is the manual, anytime version of the same control, so the
+    scoring engine can be tuned by hand instead of only from a suggested
+    review."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    session = get_session()
+    try:
+        weights = repo.get_scoring_weights(session, chat.id)
+    finally:
+        session.close()
+    lines = ["📊 Your scoring weights -- how many points each condition signal is worth for you:", ""]
+    for field, label in _WEIGHT_LABELS.items():
+        lines.append(f"{label}: {_weight_value_text(field, getattr(weights, field))}")
+    lines.append("")
+    lines.append("Tap one below to change it.")
+    await _reply(update, "\n".join(lines), reply_markup=_weights_keyboard())
+
+
 _BOT_COMMANDS = [
     BotCommand("start", "What I do and how to set me up"),
     BotCommand("setup", "Quick guided setup (budget, year, area, pickiness)"),
@@ -1141,6 +1256,7 @@ _BOT_COMMANDS = [
     BotCommand("make", "Only show certain brands, e.g. bmw, toyota"),
     BotCommand("fuel", "Only show certain fuel types, e.g. diesel"),
     BotCommand("transmission", "Only show automatic or manual"),
+    BotCommand("weights", "See and adjust scoring points for each signal"),
     BotCommand("reviewfeedback", "See patterns in the cars you liked/disliked"),
     BotCommand("validate", "Apply what the last review suggested"),
     BotCommand("cancel", "Stop whatever it's currently asking you"),
@@ -1173,6 +1289,50 @@ async def _cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await _reply(update, _welcome_text(name), reply_markup=_QUICK_SETUP_KEYBOARD)
+
+
+# Lets every command above also work without its leading "/" -- e.g. plain
+# "settings" or "budget 15000" -- since a command word typed as ordinary
+# text otherwise just falls through to _handle_plain_reply and gets
+# misread as an answer to whatever prompt (if any) is pending. Matching a
+# command word here always wins over a pending prompt, same as a real
+# slash command already does (CommandHandler runs regardless of
+# _pending_prompts) -- kept consistent rather than special-cased per
+# setting. Defined here, after every handler above (including _cmd_start)
+# exists.
+_TEXT_COMMANDS: dict[str, object] = {
+    "start": _cmd_start,
+    "help": _cmd_start,
+    "setup": _start_wizard,
+    "cancel": _cmd_cancel,
+    "find": _cmd_find,
+    "search": _cmd_search,
+    "settings": _cmd_settings,
+    "weights": _cmd_weights,
+    "showall": _cmd_weights,
+    "reviewfeedback": _cmd_reviewfeedback,
+    "validate": _cmd_validate,
+    **_PROMPTABLE_COMMANDS,
+}
+
+
+async def _handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for every non-`/` text message. Checks first whether
+    the message is actually a command typed without its slash (see
+    `_TEXT_COMMANDS`); only if it isn't does it fall back to treating the
+    text as the answer to a pending `/budget`-style prompt, exactly as
+    before this existed."""
+    if not update.message or not update.message.text:
+        return
+    words = update.message.text.strip().split()
+    if not words:
+        return
+    handler = _TEXT_COMMANDS.get(words[0].lower())
+    if handler is not None:
+        context.args = words[1:]
+        await handler(update, context)
+        return
+    await _handle_plain_reply(update, context)
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1231,12 +1391,16 @@ def run_feedback_listener() -> None:
     application.add_handler(CommandHandler("make", _cmd_make))
     application.add_handler(CommandHandler("fuel", _cmd_fuel))
     application.add_handler(CommandHandler("transmission", _cmd_transmission))
+    application.add_handler(CommandHandler("weights", _cmd_weights))
+    application.add_handler(CommandHandler("showall", _cmd_weights))
     application.add_handler(CommandHandler("reviewfeedback", _cmd_reviewfeedback))
     application.add_handler(CommandHandler("validate", _cmd_validate))
     # Must be added after every CommandHandler above -- filters.COMMAND
     # excludes slash commands, but handler order still matters for any
-    # non-command text the other handlers don't claim.
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_plain_reply))
+    # non-command text the other handlers don't claim. _handle_plain_text
+    # itself checks for a command word typed without "/" before falling
+    # back to the pending-prompt reply logic (see its docstring).
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_plain_text))
     application.add_error_handler(_error_handler)
     logger.info("Listening for feedback button presses and commands... (Ctrl+C to stop)")
     application.run_polling()
