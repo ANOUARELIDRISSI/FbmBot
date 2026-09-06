@@ -14,8 +14,10 @@ from becarscout.notifier.bot import (
     _budget_text,
     _cmd_budget,
     _cmd_settings,
+    _cmd_showall,
     _cmd_weights,
     _format_search_hit,
+    _format_showall_listing,
     _parse_csv_arg,
     _parse_int_arg,
     _parse_search_args,
@@ -243,11 +245,33 @@ def test_text_commands_covers_every_promptable_command():
     assert set(_PROMPTABLE_COMMANDS.keys()) <= set(_TEXT_COMMANDS.keys())
 
 
-def test_text_commands_includes_weights_and_its_showall_alias():
+def test_text_commands_includes_weights_and_showall_as_distinct_commands():
     assert _TEXT_COMMANDS["weights"] is _cmd_weights
-    assert _TEXT_COMMANDS["showall"] is _cmd_weights
+    assert _TEXT_COMMANDS["showall"] is _cmd_showall
+    assert _cmd_weights is not _cmd_showall
 
 
 def test_text_commands_maps_plain_words_to_the_same_handlers_as_their_slash_command():
     assert _TEXT_COMMANDS["settings"] is _cmd_settings
     assert _TEXT_COMMANDS["budget"] is _cmd_budget
+
+
+def _make_scored(listing_id="l1", score=10, **overrides) -> ScoredListing:
+    defaults = dict(listing_id=listing_id, url=f"https://example.test/{listing_id}", raw_title="VW Golf 7 TDI", score=score)
+    defaults.update(overrides)
+    return ScoredListing(**defaults)
+
+
+def test_format_showall_listing_includes_score_and_remaining_count():
+    listing = _make_scored(score=34, price_eur=9500, year=2016, mileage_km=120000)
+    text = _format_showall_listing(listing, remaining=3)
+    assert "(3 left)" in text
+    assert "Engine's score: +34" in text
+    assert "€9,500" in text
+    assert listing.url in text
+
+
+def test_showall_is_not_yet_a_promptable_command():
+    # /showall manages its own review-session state (_showall_queue), not
+    # the single-slot _pending_prompts mechanism the other settings share.
+    assert "showall" not in _PROMPTABLE_COMMANDS

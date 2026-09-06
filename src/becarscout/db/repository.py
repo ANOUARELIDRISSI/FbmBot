@@ -363,6 +363,29 @@ def get_user_scores_by_listing_ids(session: Session, chat_id: int, listing_ids: 
     }
 
 
+def get_recent_scored_listings(session: Session, chat_id: int, limit: int = 20) -> list[ScoredListing]:
+    """This subscriber's most recently scored listings, newest first --
+    backs Telegram's `/showall` review flow (see `notifier/bot.py`),
+    where a person walks through their own recent scores and corrects
+    ones the engine got wrong."""
+    user_rows = (
+        session.execute(
+            select(UserListingScoreRow)
+            .where(UserListingScoreRow.chat_id == chat_id, UserListingScoreRow.scored_at.is_not(None))
+            .order_by(UserListingScoreRow.scored_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    result = []
+    for user_row in user_rows:
+        listing_row = session.get(ListingRow, user_row.listing_id)
+        if listing_row is not None:
+            result.append(_row_to_scored(listing_row, user_row))
+    return result
+
+
 def get_unnotified_opportunities(session: Session, chat_id: int) -> list[ScoredListing]:
     user_rows = (
         session.execute(

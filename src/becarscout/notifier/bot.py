@@ -40,7 +40,7 @@ from telegram.request import HTTPXRequest
 from becarscout.db import get_session
 from becarscout.db import repository as repo
 from becarscout.db.models import ListingRow
-from becarscout.feedback_agent import apply_latest_suggestions, run_feedback_review
+from becarscout.feedback_agent import apply_latest_suggestions, run_feedback_review, run_score_calibration
 from becarscout.feedback_agent.memory import find_similar_feedback, store_feedback_memory
 from becarscout.scoring.models import ScoredListing, ScoringWeights
 from becarscout.structurer.makes import MAKES
@@ -194,6 +194,7 @@ def _welcome_text(name: str | None) -> str:
         "🔎 /find — search right now instead of waiting for the next hour\n"
         "🔍 /search — look through cars I've already found, e.g. /search golf or /search today\n"
         "📊 /weights — see and hand-adjust exactly how many points each condition signal is worth\n"
+        "📝 /showall — review your recent scored listings one by one and correct any the engine got wrong\n"
         "👍 / 👎 — tap the buttons under a car to tell me if you like it, "
         "so I get better at picking cars for you over time\n"
         "🚫 /cancel — stop whatever it's currently asking you\n\n"
@@ -637,16 +638,18 @@ async def _handle_settings_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _cmd_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/cancel` — clears a pending `/budget`-style prompt or an in-progress
-    `/setup` run. Without this, a stray message sent while a prompt is
-    pending would otherwise get silently swallowed as that prompt's
-    answer, with no way to back out."""
+    """`/cancel` — clears a pending `/budget`-style prompt, an in-progress
+    `/setup` run, or an in-progress `/showall` review. Without this, a
+    stray message sent while one of these is active would otherwise get
+    silently swallowed as its answer, with no way to back out."""
     chat = update.effective_chat
     if not chat:
         return
     had_prompt = _pending_prompts.pop(chat.id, None) is not None
     had_wizard = _wizard_queue.pop(chat.id, None) is not None
-    if had_prompt or had_wizard:
+    had_showall = _showall_queue.pop(chat.id, None) is not None
+    _showall_corrections.pop(chat.id, None)
+    if had_prompt or had_wizard or had_showall:
         await _reply(update, "Okay, cancelled — nothing changed.")
     else:
         await _reply(update, "Nothing to cancel.")
@@ -1218,13 +1221,14 @@ async def _cmd_validate(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _cmd_weights(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/weights` (also `/showall`) -- lists every point value the scoring
-    engine adds or subtracts for a condition signal, personal to this
-    subscriber, with a button to change each one directly. These are the
-    same numbers /validate can change from an approved feedback review --
-    this is the manual, anytime version of the same control, so the
-    scoring engine can be tuned by hand instead of only from a suggested
-    review."""
+    """`/weights` -- lists every point value the scoring engine adds or
+    subtracts for a condition signal, personal to this subscriber, with a
+    button to change each one directly. These are the same numbers
+    /validate can change from an approved feedback review -- this is the
+    manual, anytime version of the same control, so the scoring engine
+    can be tuned by hand instead of only from a suggested review. For
+    correcting the engine from real listings instead of raw point values,
+    see `/showall`."""
     chat = update.effective_chat
     if not chat:
         return
@@ -1239,6 +1243,131 @@ async def _cmd_weights(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
     lines.append("")
     lines.append("Tap one below to change it.")
     await _reply(update, "\n".join(lines), reply_markup=_weights_keyboard())
+
+
+_SHOWALL_LIMIT = 20
+
+# Chat id -> listings still left to review in an in-progress /showall
+# session, and chat id -> the corrections given so far in that session.
+# In-memory and per-process only, same tradeoff as `_pending_prompts` --
+# a listener restart mid-review just means starting over, no data is lost
+# since nothing is applied to scoring until /validate anyway.
+_showall_queue: dict[int, list[ScoredListing]] = {}
+_showall_corrections: dict[int, list[dict]] = {}
+
+
+def _format_showall_listing(listing: ScoredListing, remaining: int) -> str:
+    stats = []
+    if listing.price_eur is not None:
+        stats.append(f"€{listing.price_eur:,}")
+    if listing.year is not None:
+        stats.append(str(listing.year))
+    if listing.mileage_km is not None:
+        stats.append(f"{listing.mileage_km:,} km")
+    header = listing.raw_title
+    if stats:
+        header += " -- " + " · ".join(stats)
+    return (
+        f"({remaining} left) {header}\n"
+        f"Engine's score: {listing.score:+d}\n"
+        f"{listing.url}\n\n"
+        'What score would you give this one? Type a number, "skip", or "done"/"exit" to finish.'
+    )
+
+
+async def _cmd_showall(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/showall` -- walks through this subscriber's most recently scored
+    listings one at a time, showing the engine's score and asking what
+    score they'd actually give it. Corrections accumulate in memory until
+    "done"/"exit" (or `/cancel`), at which point they're turned into
+    suggested scoring-weight changes the same way `/reviewfeedback` does
+    from liked/disliked patterns -- see `feedback_agent/calibration.py` --
+    awaiting `/validate` before anything actually changes. This is the
+    "correct the engine from real listings" counterpart to `/weights`'s
+    "edit the raw point values directly"."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    if chat.id in _showall_queue:
+        await _reply(
+            update,
+            f'You\'re already reviewing ({len(_showall_queue[chat.id])} left) -- '
+            'type done/exit to finish, or /cancel to stop.',
+        )
+        return
+    session = get_session()
+    try:
+        listings = repo.get_recent_scored_listings(session, chat.id, limit=_SHOWALL_LIMIT)
+    finally:
+        session.close()
+    if not listings:
+        await _reply(update, "You don't have any scored listings yet -- try /find first.")
+        return
+    _showall_queue[chat.id] = listings
+    _showall_corrections[chat.id] = []
+    await _reply(
+        update,
+        f"📝 Reviewing your {len(listings)} most recently scored listings, newest first. "
+        'For each one, type the score you\'d actually give it, "skip" to leave it, or '
+        '"done"/"exit" to finish anytime -- your corrections turn into suggested scoring '
+        "changes, same as /reviewfeedback.",
+    )
+    await _reply(update, _format_showall_listing(listings[0], len(listings)))
+
+
+async def _handle_showall_word(chat_id: int, word: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles one plain-text reply while chat_id is mid-`/showall`
+    review -- called from `_handle_plain_text` instead of the normal
+    command/pending-prompt dispatch, since a review session's own state
+    (`_showall_queue`) isn't a `_pending_prompts` entry."""
+    lowered = word.lower()
+    if lowered in ("done", "exit"):
+        await _finish_showall(chat_id, update)
+        return
+    if lowered == "cancel":
+        await _cmd_cancel(update, context)
+        return
+
+    queue = _showall_queue.get(chat_id)
+    if not queue:
+        return
+    listing = queue[0]
+
+    if lowered != "skip":
+        value = _parse_int_arg(word)
+        if value is None:
+            await _reply(update, 'Type a number for the score you\'d give it, or "skip", or "done"/"exit" to finish.')
+            return
+        _showall_corrections[chat_id].append(
+            {
+                "listing_id": listing.listing_id,
+                "title": listing.raw_title,
+                "model_score": listing.score,
+                "user_score": value,
+                "reasoning": listing.reasoning,
+            }
+        )
+        await _reply(update, f"✅ Noted -- you'd give this a {value:+d} (engine said {listing.score:+d}).")
+
+    queue.pop(0)
+    if not queue:
+        await _finish_showall(chat_id, update)
+        return
+    await _reply(update, _format_showall_listing(queue[0], len(queue)))
+
+
+async def _finish_showall(chat_id: int, update: Update) -> None:
+    corrections = _showall_corrections.pop(chat_id, [])
+    _showall_queue.pop(chat_id, None)
+    if not corrections:
+        await _reply(update, "Okay, review ended -- no corrections given, nothing to learn from this time.")
+        return
+    await _reply(update, f"📊 Got {len(corrections)} correction(s) -- working out what that means for scoring...")
+    result = run_score_calibration(chat_id, corrections)
+    if result.get("skipped"):
+        await _reply(update, result["skip_reason"])
+        return
+    await _reply(update, result["report_markdown"])
 
 
 _BOT_COMMANDS = [
@@ -1257,6 +1386,7 @@ _BOT_COMMANDS = [
     BotCommand("fuel", "Only show certain fuel types, e.g. diesel"),
     BotCommand("transmission", "Only show automatic or manual"),
     BotCommand("weights", "See and adjust scoring points for each signal"),
+    BotCommand("showall", "Review recent listings one by one and correct their score"),
     BotCommand("reviewfeedback", "See patterns in the cars you liked/disliked"),
     BotCommand("validate", "Apply what the last review suggested"),
     BotCommand("cancel", "Stop whatever it's currently asking you"),
@@ -1309,7 +1439,7 @@ _TEXT_COMMANDS: dict[str, object] = {
     "search": _cmd_search,
     "settings": _cmd_settings,
     "weights": _cmd_weights,
-    "showall": _cmd_weights,
+    "showall": _cmd_showall,
     "reviewfeedback": _cmd_reviewfeedback,
     "validate": _cmd_validate,
     **_PROMPTABLE_COMMANDS,
@@ -1317,15 +1447,21 @@ _TEXT_COMMANDS: dict[str, object] = {
 
 
 async def _handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point for every non-`/` text message. Checks first whether
-    the message is actually a command typed without its slash (see
-    `_TEXT_COMMANDS`); only if it isn't does it fall back to treating the
-    text as the answer to a pending `/budget`-style prompt, exactly as
-    before this existed."""
+    """Entry point for every non-`/` text message. A chat mid-`/showall`
+    review takes priority over everything else, since "5", "skip", or
+    "done" mid-review aren't meant as commands or settings answers. Only
+    then does this check whether the message is a command typed without
+    its slash (see `_TEXT_COMMANDS`), falling back to the answer to a
+    pending `/budget`-style prompt otherwise, exactly as before either of
+    these existed."""
     if not update.message or not update.message.text:
         return
     words = update.message.text.strip().split()
     if not words:
+        return
+    chat = update.effective_chat
+    if chat and chat.id in _showall_queue:
+        await _handle_showall_word(chat.id, words[0], update, context)
         return
     handler = _TEXT_COMMANDS.get(words[0].lower())
     if handler is not None:
@@ -1392,7 +1528,7 @@ def run_feedback_listener() -> None:
     application.add_handler(CommandHandler("fuel", _cmd_fuel))
     application.add_handler(CommandHandler("transmission", _cmd_transmission))
     application.add_handler(CommandHandler("weights", _cmd_weights))
-    application.add_handler(CommandHandler("showall", _cmd_weights))
+    application.add_handler(CommandHandler("showall", _cmd_showall))
     application.add_handler(CommandHandler("reviewfeedback", _cmd_reviewfeedback))
     application.add_handler(CommandHandler("validate", _cmd_validate))
     # Must be added after every CommandHandler above -- filters.COMMAND

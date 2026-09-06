@@ -183,18 +183,24 @@ one radius has to define what gets scraped for everyone; see Project.md).
 - `/fuel <type, type, ...>` or `/fuel off` — only show specific fuel types (`electric`,
   `hybrid`, `lpg`, `diesel`, `petrol`).
 - `/transmission <automatic|manual>` or `/transmission off` — only show one gearbox type.
-- `/weights` (also `/showall`) — lists every point value the scoring engine adds or
-  subtracts for a condition signal (gearbox/engine issues, accident damage, warning lights,
-  timing belt, inspection, service history, export listings, the minimum plausible car
-  price), personal to you, with a button to hand-adjust each one directly. Same numbers
-  `/validate` can change from an approved feedback review — this is the manual, anytime
-  version of the same control, so you can tune the scoring engine yourself as you see which
-  signals matter to you.
+- `/weights` — lists every point value the scoring engine adds or subtracts for a
+  condition signal (gearbox/engine issues, accident damage, warning lights, timing belt,
+  inspection, service history, export listings, the minimum plausible car price), personal
+  to you, with a button to hand-adjust each one directly. Same numbers `/validate` can
+  change from an approved feedback review — this is the manual, anytime version of the same
+  control, editing the raw point values yourself.
+- `/showall` — a different way to correct the engine: walks through your most recently
+  scored listings *one at a time*, showing the engine's score for each, and asks what score
+  you'd actually give it. Type a number to correct it, `skip` to leave it, or `done`/`exit`
+  to finish whenever you like. Your corrections are turned into suggested weight changes the
+  same way `/reviewfeedback` does from 👍/👎 patterns — nothing changes until you `/validate`
+  them. Unlike `/weights`, you never touch a raw point value yourself; you just say "this
+  should have scored higher/lower" on real listings and let the engine work out why.
 - `/reviewfeedback` — runs stage 7's review agent over your accumulated 👍/👎 and posts the
   patterns + suggested scoring weight changes it found.
-- `/validate` — applies the *last* `/reviewfeedback`'s suggestions for real. This is the
-  only command that changes scoring behavior; everything else in stage 7 is advisory until
-  you send this. Nothing is applied automatically, ever.
+- `/validate` — applies the *last* `/reviewfeedback` or `/showall` run's suggestions for
+  real. This is the only command that changes scoring behavior; everything else in stage 7
+  is advisory until you send this. Nothing is applied automatically, ever.
 
 `/budget`, `/minyear`, `/threshold`, `/radius`, `/mileage`, `/make`, `/fuel`, and
 `/transmission` all also work as a two-step prompt: send the command with no arguments (or

@@ -185,6 +185,36 @@ def test_get_unnotified_opportunities_only_returns_this_chats_above_threshold(se
     assert repo.get_unnotified_opportunities(session, CHAT_B) == []
 
 
+def test_get_recent_scored_listings_orders_newest_first_and_is_per_chat(session):
+    _make_row(session, "l1")
+    _make_row(session, "l2")
+    _make_user_score(session, CHAT_A, "l1", scored_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    _make_user_score(session, CHAT_A, "l2", scored_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+    _make_user_score(session, CHAT_B, "l1", scored_at=datetime(2026, 1, 3, tzinfo=timezone.utc))
+
+    result = repo.get_recent_scored_listings(session, CHAT_A)
+
+    assert [s.listing_id for s in result] == ["l2", "l1"]
+
+
+def test_get_recent_scored_listings_respects_limit(session):
+    _make_row(session, "l1")
+    _make_row(session, "l2")
+    _make_user_score(session, CHAT_A, "l1", scored_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    _make_user_score(session, CHAT_A, "l2", scored_at=datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    result = repo.get_recent_scored_listings(session, CHAT_A, limit=1)
+
+    assert [s.listing_id for s in result] == ["l2"]
+
+
+def test_get_recent_scored_listings_excludes_never_scored_rows(session):
+    _make_row(session, "l1")
+    _make_user_score(session, CHAT_A, "l1", scored_at=None)
+
+    assert repo.get_recent_scored_listings(session, CHAT_A) == []
+
+
 def test_mark_notified_only_affects_that_chat(session):
     _make_row(session, "l1")
     _make_user_score(session, CHAT_A, "l1", above_threshold=True, scored_at=datetime.now(timezone.utc))
